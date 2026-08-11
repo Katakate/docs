@@ -1,0 +1,67 @@
+---
+title: "Architecture"
+description: "The k7d stack: daemon, containerd shim, guest agent — who owns what"
+---
+
+k7d is three cooperating pieces of Rust plus a minimal guest image:
+
+```text
+                     ┌────────────────────────┐
+ user / kubectl ───▶ │  kube-apiserver        │
+                     └───────────┬────────────┘
+                                 ▼
+                     ┌────────────────────────┐
+                     │  kubelet → containerd  │
+                     └───────────┬────────────┘
+                                 │ exec()s a per-pod shim
+                                 ▼
+ ═══════════════════════════════════════════════════ host
+                     ┌──────────────────────────┐
+                     │  containerd-shim-k7-v1   │  one process per pod;
+                     │  (Task ttrpc service)    │  thin client of the daemon
+                     └───────────┬──────────────┘
+                                 │ JSON-lines over /run/k7d/k7d.sock
+                                 ▼
+                     ┌──────────────────────────┐
+                     │  k7d daemon              │  owns VM lifecycle: KVM,
+                     │  (k7d.service)           │  guest memory, vsock,
+                     │                          │  virtiofsd, bridges, trees
+                     └───────────┬──────────────┘
+                                 │ KVM ioctls, mmap, eventfds,
+                                 │ vhost, TAP
+                                 ▼
+ ═══════════════════════════════════════════════════ guest
+                     ┌──────────────────────────┐
+                     │  guest Linux kernel      │  minimal vmlinux,
+                     │  (virtio-mmio drivers)   │  virtio-mmio only
+                     └───────────┬──────────────┘
+                                 ▼
+                     ┌──────────────────────────┐
+                     │  k7-agent (PID 1)        │  vsock JSON server;
+                     └───────────┬──────────────┘  invokes runc
+                                 ▼
+                     ┌──────────────────────────┐
+                     │  workload container(s)   │  user images
+                     └──────────────────────────┘
+```
+
+## Who owns what
+
+- **The daemon owns the VMs.** `k7d` runs as a long-lived systemd service and owns every VM's KVM file descriptors, guest memory, vsock, virtiofsd children, bridges, and snapshot trees. Clients — the containerd shim, the k7 Python backend, your RL trainer — talk to it over a Unix socket, one JSON object per line. See [Daemon API](/k7d/api/protocol).
+- **The shim is a thin client.** containerd spawns one `containerd-shim-k7-v1` per pod; its sandbox `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly if the daemon is not running. Because VMs outlive shims, a respawned shim reattaches to its still-running VM (`reattach_sandbox`).
+- **The agent is not a Kubernetes component.** `k7-agent` is a tiny static binary baked into the guest initramfs, running as PID 1. It exposes a JSON-line RPC over vsock (commands like `ping`, `exec`, `read_file`, `write_file`, `container_start`, `container_exec`, `container_stop`, `container_output`). Clients reach the agent directly over vsock using the `guest_cid` the daemon returns — the daemon does not proxy the agent protocol.
+- **`runc` runs *inside* the guest**, never on the host. Container bundles reach the VM via erofs images on virtio-blk (or virtiofs as a read-write fallback); the agent invokes `runc` against them.
+
+## Design choices worth knowing
+
+- **virtio-MMIO only, no PCI.** Each virtio device is a 4 KiB MMIO window above guest RAM, discovered from the kernel cmdline. PCI bus emulation would add ~2k LoC for nothing k7d needs. Device set: virtio-net (userspace TAP pump), vhost-vsock (kernel) for the agent, virtiofs (vhost-user) for shared directories, virtio-blk for disk images, plus two legacy serial ports for console and agent fallback.
+- **Guest memory is one mmap.** Either memfd-backed (fresh VM) or `MAP_PRIVATE` over a snapshot file (restored/forked VM) — the foundation of [CoW fork](/k7d/concepts/cow-fork).
+- **No async in the VMM.** Plain threads + `Arc<Mutex<...>>`; only the shim is tokio-based (containerd's shim protocol is async). Every cross-thread signal is an eventfd.
+- **Errors are loud.** Typed errors per module, no silent fallbacks, no `unwrap()` in library code. Resources (KVM fds, TAP devices, virtiofsd children) are cleaned up via `Drop` — drop order is deliberate so device worker threads never touch freed guest memory.
+- **Rootfs via erofs on virtio-blk.** Read-only host paths are packed into cached erofs images and attached as block devices. This is what keeps cluster forks CoW: no per-fork memory copies for filesystem shares (the pre-14a virtiofs path forced a full memory copy per fork and survives only as the fallback for read-write hostPath).
+
+## The "start a pod" path
+
+`kubectl apply` (with `runtimeClassName: k7`) → kubelet → containerd → exec `containerd-shim-k7-v1` → shim `create_vm` over the daemon socket (daemon builds the VM: kernel, initramfs, vsock, network, block devices; ~163 ms to agent-ready, or served warm from the [pool](/k7d/api/protocol#pool_status)) → shim tells the agent to `container_start` the OCI bundle → agent runs `runc` → an output bridge polls `container_output` and writes into containerd's FIFOs — which is how `kubectl logs` works.
+
+Setup steps for the RuntimeClass: [RuntimeClass k7](/k7d/guides/runtime-class).

@@ -1,0 +1,33 @@
+---
+title: "Network identity"
+description: "Why a forked cluster doesn't reboot: per-fork bridges with replayed IPs and MACs"
+---
+
+The non-obvious half of the ~100 ms cluster fork claim is networking. Forking the VMs is memory mechanics ([CoW fork](/k7d/concepts/cow-fork)); keeping Kubernetes *running* inside them is a network-identity problem.
+
+## The cluster does not reboot because the network lies consistently
+
+Each cluster lives on its own private Linux bridge. A fork gets a **new** bridge with the **same** guest IPs and MAC addresses as the source. From inside the guest, nothing moved — same addresses, same ARP cache, same TLS certs, same established TCP — so kubelet, the CNI, and the control plane keep running.
+
+Separate bridges mean forks cannot see each other, so the identical addresses never conflict: identical IPs only work because the L2 domains are separate.
+
+Without this trick, every fork would force a kubelet restart and a ~1–2 s agent restart per node, and the 100 ms claim would be impossible. The benchmark suite proves the point by holding a `?watch=true` streaming connection to the kube-apiserver **across the fork** — the TLS session survives on both the source and the copy.
+
+## The plumbing
+
+- Each VM gets a **TAP device** (a virtual Ethernet interface: writes to its fd become frames on the host network stack, and vice versa).
+- TAPs attach to a per-cluster **Linux bridge** (`k7-br-<cluster>`); **iptables MASQUERADE** NATs bridge traffic out the host's default interface.
+- Each VM gets a stable IP allocated from the bridge's subnet, determined by its `vm_index` (`10.200.0.{2 + vm_index}`).
+- A fork replays the source's `vm_index` → IP/MAC assignments onto its own fresh bridge.
+- When a pod is CNI-managed (RuntimeClass mode), the TAP can be moved into the CNI pod network namespace, so the VM answers on the pod IP like any other pod.
+
+## What survives a fork — and what doesn't
+
+**Survives:** everything inside the forked set — in-cluster TLS, established TCP between member VMs, disk state, process state. Guest clocks are reset so time does not jump backwards.
+
+**Doesn't survive:** TCP connections to the *outside* world — the far end never forked, and the fork's host-facing identity is new. Forks keep their in-cluster addresses; only the host-facing side changes.
+
+## Related pages
+
+- [Cluster mode](/k7d/guides/cluster-mode) — creating, adopting, and forking multi-VM clusters
+- [Security model](/k7d/concepts/security) — isolation boundaries between forks

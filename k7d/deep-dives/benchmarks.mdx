@@ -1,0 +1,97 @@
+---
+title: "Benchmarks"
+description: "Named hardware, exact commands, and enforced latency budgets for every claim"
+---
+
+Reproducible numbers for the claim: **warm-fork a live multi-VM Kubernetes cluster in well under a second**, with TLS sessions surviving and the source cluster still answering.
+
+Every number below is an **integration-test assertion**, not a one-off benchmark paste. The budget constants live in [`crates/k7d/src/latency.rs`](https://github.com/katakate/k7d/blob/main/crates/k7d/src/latency.rs) (the single source of truth, imported by the tests) and are documented in [`LATENCY_BUDGETS.md`](https://github.com/katakate/k7d/blob/main/LATENCY_BUDGETS.md). If a number here drifts from those files, **trust the tests**. Budgets are set at roughly 2× the typical observed value.
+
+## Hardware
+
+One pinned bare-metal node (~€40/month Hetzner) used for all figures:
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 5 3600 (6c/12t, up to ~4.2 GHz) |
+| RAM | 64 GiB |
+| Storage | 2× Samsung 512 GB NVMe |
+| OS | Ubuntu LTS, Linux KVM |
+| Devices | `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`, virtiofsd |
+| Runtime | k3s + RuntimeClass `k7` + `k7d.service` |
+
+## Headline results (enforced + measured)
+
+| Operation | Enforced budget | Typical / measured | Test |
+|---|---|---|---|
+| Warm single-VM fork (`<25%` dirty) | 50 ms | ~5 ms | `test_fork_warm_under_50ms` |
+| 10× warm fork batch | 200 ms | ~15 ms | `test_fork_warm_batch_10` |
+| On-host 3-VM cluster warm fork (busybox) | 150 ms | ~25–40 ms quiet / ~70–100 ms loaded | `test_cluster_fork_warm_3vm_under_50ms` |
+| Cluster-tree fork (busybox, 3 VMs) | 750 ms | ~75 ms quiet | `test_cluster_tree_fork_under_75ms` |
+| Cluster warm fork batch (8× 3 VMs) | 2 s | shared pause; beats 8× single ceiling | `test_cluster_fork_warm_batch_8` |
+| Cluster-tree fork batch (50× 3 VMs) | 20 s | **~4.1 s** (~82 ms/cluster) shared pause + parallel materialise | `test_cluster_tree_fork_batch_50` |
+| **Inner-k3s cluster-tree fork (3 VMs)** | **1 s** | **~104 ms** under churn (pause Deployment scale + ConfigMap/pause-pod storm); CoW path (~70 ms on-host `fork_cluster_warm`) | `test_inner_k3s_cluster_warm_fork_no_restart` |
+
+## Full budget table
+
+| Operation | Budget | Typical |
+|---|---|---|
+| VM build (KVM + memfd + virtiofsd) | 150 ms | ~62 ms |
+| VM boot → agent ready | 250 ms | ~163 ms |
+| Agent ping RTT | 1 ms | ~0.2 ms |
+| Agent exec RTT | 2 ms | ~0.5 ms |
+| Virtiofs read / write | 2 ms | ~1 ms |
+| Snapshot 256 MB VM | 500 ms | ~228 ms |
+| CoW restore from snapshot | 10 ms | ~3 ms |
+| Fork (cold source) | 600 ms | ~250 ms |
+| Cluster-tree suspend (3 VMs) | 750 ms | ~25 ms quiet |
+| Cluster-tree resume (3 VMs) | 750 ms | ~40 ms quiet |
+| VM shutdown | 5 ms | ~0.05 ms |
+| Pool acquire (pooled `create_vm` round trip) | 100 ms | ~50 ms |
+
+## Reproduce
+
+On a node with the repo and toolchain installed:
+
+```bash
+# Full enforced suite (fmt + deny + clippy + all tests, --test-threads=1):
+make check
+
+# Headline path only:
+cargo test -p k7d --test test_inner_k3s \
+  test_inner_k3s_cluster_warm_fork_no_restart \
+  -- --test-threads=1 --nocapture
+
+# Packaging demo (busybox, fast):
+cd examples/cluster-tree-search && python3 run_demo.py --mode busybox --branches 4
+
+# Scale check — shared-pause batch of 50× 3-VM clusters:
+cargo test -p k7d --test test_cluster_tree \
+  test_cluster_tree_fork_batch_50 -- --test-threads=1 --nocapture
+```
+
+The inner-k3s test prints a line like:
+
+```text
+TreeFork node=warm-0000 cids=[…] elapsed=105.062575ms budget=1s
+daemon: fork_cluster_warm '…': 3 VMs in 69.703248ms
+```
+
+## How the fast path was won
+
+Before the block-rootfs work, cluster pods carried a virtiofs share for the k3s hostPath — so every fork forced a full memory copy of 3 × ~3.2 GiB, landing at ~2 s typical. Moving read-only hostPath mounts to cached **erofs images on virtio-blk** (zero virtiofs shares) let every member fork `MAP_PRIVATE` + dirty-page CoW: **~105 ms** under a 1 s budget. The share-less fork prep also preserves the source's vsock CID, so `kubectl exec` against the source still works after adopt/fork.
+
+## Comparison (honest)
+
+| Operation | kind | vcluster | CubeSandbox-style sandbox clone | **k7d** |
+|---|---|---|---|---|
+| Fresh isolated Kubernetes | ~30–60 s cold | ~20 s | n/a (not a cluster) | **warm fork of a live 3-node cluster (~105 ms typical)** |
+| Unit of fork | n/a | n/a | one microVM / process sandbox | **the whole cluster** (control plane + workers) |
+| Surviving TLS across fork | n/a | n/a | no (new sandbox) | **yes** (a held `?watch=true` stream survives) |
+| Source still answers after fork | n/a | n/a | n/a | **yes** (CID-stable prepare) |
+
+### What we are *not* claiming
+
+- Firecracker-beating cold boot (we boot once, then fork).
+- "&lt;5 MB per instance" density (our guests run kubelet).
+- That the virtiofs era (~2 s full-copy) was the intended steady state — it is now the explicit fallback for read-write hostPath only.

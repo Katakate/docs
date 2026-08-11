@@ -1,0 +1,46 @@
+---
+title: "CoW fork"
+description: "How a ~5 ms fork of a running VM is possible: MAP_PRIVATE, dirty-page tracking, and what had to be right"
+---
+
+You do not need to be a VMM engineer to use k7d. You do need to know *why* a millisecond-scale fork of a running VM is even possible, because that is the product.
+
+## Memory is shared until someone writes
+
+Guest RAM lives in one file. A fork pauses the source for a moment, notes which pages changed since the last checkpoint, maps the child's memory as a **copy-on-write view** of the parent's, and copies only those dirty pages. Everything else is shared. That is why 50 forks of a cluster fit in 64 GB: you pay for divergence, not for the base.
+
+The two kernel mechanisms underneath:
+
+- **`mmap(MAP_PRIVATE)` restore.** A naïve restore reads the whole memory snapshot into a buffer — a 256 MB memcpy, ~50–100 ms. Instead, k7d maps the snapshot file `MAP_PRIVATE`: the kernel maps file pages into the new VM's address space without copying. Reads come straight from the page cache; the first guest *write* to a page triggers a copy-on-write fault. Restore time becomes O(1) — ~3 ms regardless of memory size.
+- **KVM dirty-page tracking.** `KVM_MEM_LOG_DIRTY_PAGES` makes KVM write-protect every guest page and record first writes in a bitmap (one bit per 4 KiB). This is how a warm fork knows which pages to copy from the source.
+
+## Cold fork vs warm fork
+
+**Cold fork** (~250 ms): snapshot the source to disk (pause, capture CPU + device state, dump memory), then restore into a new VM with `MAP_PRIVATE` memory. Bottlenecked by writing guest RAM to disk.
+
+**Warm fork** (~5 ms) avoids the disk write:
+
+1. **One-time prep**: cold-snapshot once → restore once → enable KVM dirty tracking. Now the base memory image lives on disk and the source VM is "fork-ready".
+2. **Per fork**: pause the source for ~1 ms → read the dirty bitmap (only pages dirtied since the last fork) → memcpy those pages into the new fork's `MAP_PRIVATE` mapping of the base image → capture CPU/device state in memory → resume the source.
+
+The only work proportional to dirty pages is the memcpy (~0.5 µs per page — ≤15 ms even at 100% dirty). Everything else is O(1). Batch forks (`tree_fork_batch`) share a single pause + dirty-bitmap capture across N forks.
+
+Disk state is copied with **filesystem reflinks** (btrfs `--reflink` / `FICLONERANGE`): a "copy" that shares all data extents copy-on-write, O(1) regardless of size.
+
+## What had to be right
+
+These are the kinds of bugs that silently break "byte-identical". The project's [CHALLENGES.md](https://github.com/katakate/k7d/blob/main/CHALLENGES.md) catalogs all of them; three headline ones:
+
+1. **Device writes are invisible to the hypervisor's dirty log.** Block devices in k7d write guest memory from userspace. The hypervisor only sees CPU writes — so a fork taken after disk I/O would resurrect *pre-I/O* bytes on those pages (silent corruption). Fix: track device dirty pages separately, merge them into the fork bitmap, and drain in-flight I/O before the bitmap is read.
+2. **A restored guest with a blank timer chip freezes time.** After fork, the interval timer was left unprogrammed — no timer interrupts, `CLOCK_REALTIME` stuck, and Kubernetes quietly parks. Fix: re-arm the timer (and reset the paravirtual clock) on every restore.
+3. **Identical IPs only work if the L2 domains are separate.** Replay the source's addresses onto a fresh bridge per fork. Same view from inside; no conflicts across forks. See [Network identity](/k7d/concepts/network-identity).
+
+## After the fork: reconnecting to the guest
+
+The fork inherits the source's vsock device state, including any open agent connection — but the fork gets a fresh vsock CID. k7d injects a virtio-vsock `TRANSPORT_RESET` event into the *fork's* device state only: the guest sees its connection drop, the in-guest agent reconnects on the new CID, and the host can talk to the fresh fork. Guest clocks are reset so time does not jump backwards.
+
+## Related pages
+
+- [Snapshot tree](/k7d/concepts/snapshot-tree) — how forks are organized, budgeted, and evicted
+- [Architecture](/k7d/concepts/architecture) — where fork sits in the stack
+- [Benchmarks](/k7d/deep-dives/benchmarks) — the enforced numbers

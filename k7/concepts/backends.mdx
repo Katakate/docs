@@ -1,0 +1,110 @@
+---
+title: "Backends"
+description: "kata-firecracker-devmapper vs kata-qemu-longhorn vs k7d — how to choose"
+---
+
+A **backend** in Katakate combines a VM runtime with a storage driver. There are three: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), and `k7d`.
+
+<Note>
+**Deprecated aliases:** `fd` and `ql` (and the long names without the `kata-` prefix) are older names for `kfd` / `kata-firecracker-devmapper` and `kql` / `kata-qemu-longhorn`. They still resolve for backwards compatibility, but new configs should use the current names.
+</Note>
+
+## At a glance
+
+| | `kata-firecracker-devmapper` (`kfd`) | `kata-qemu-longhorn` (`kql`) | `k7d` |
+|--|------------------------------|-----------------------|-------|
+| Runtime class | `kata-fc` | `kata-qemu` | `k7` |
+| Hypervisor | Firecracker (microVM) via Kata | QEMU via Kata | [k7d](/k7d/index) — purpose-built Rust VMM |
+| Process isolation | **Jailer** (chroot, dropped caps, seccomp) | Kata's built-in sandboxing | KVM hardware isolation (see [k7d security model](/k7d/concepts/security)) |
+| Storage driver | LVM thin-pool + containerd devmapper snapshotter | Longhorn CSI (replicated PVCs) | erofs images on virtio-blk + host-local state |
+| Persistent disk per sandbox | Ephemeral (devmapper LV, lost on delete) | Yes — `<sandbox>-root-lh` PVC, sized via `--root-disk-size` | Host-local VM state |
+| Snapshots / pause / resume / fork | ❌ Not supported | ✅ Disk-level, via VolumeSnapshots (~45 s fork) | ✅ Full VM state (memory + disk + processes + network), ~5 ms warm fork |
+| Multi-node replication | ❌ Node-local thin pool | ✅ Longhorn replicas across nodes | ❌ Host-local trees today |
+| Cold-create latency | Faster (microVM boot) | Slower (full VM boot + PVC bind) | ~163 ms VM boot to agent ready |
+| Privileged container required | No | **Yes** (for the bind-mount persistence wrapper) | No |
+| Best for | Many small ephemeral workloads, AI agents, CI runners | Long-lived workloads, replicated state | Fork-heavy workflows: RL rollouts, agent tree search, snapshot trees |
+
+## Choosing a backend
+
+Pick **`kata-firecracker-devmapper`** when:
+
+- You run many short-lived sandboxes per node and want the smallest possible footprint.
+- You don't need to pause, resume, fork, or persist state between restarts.
+- You're on a single node and don't need replication.
+- Security is paramount: Firecracker has the smallest attack surface, and the **jailer** is active (verified by `tests/integration/test_firecracker.py::test_jailer_active`).
+
+Pick **`kata-qemu-longhorn`** when:
+
+- You need a real persistent disk that survives pod restarts (`/mnt/state` mount inside the sandbox).
+- You want to `pause` / `resume` / `fork` sandboxes at the disk level.
+- You run multi-node and want data to survive node failure (Longhorn replicates).
+- You need bigger root disks (sized with `--root-disk-size`).
+
+Pick **`k7d`** when:
+
+- Fork latency matters: k7d warm-forks a running VM in ~5 ms with faithful memory, disk, process, and network state — versus ~45 s for a disk-only Longhorn fork.
+- You want snapshot trees: fork many branches from a checkpoint, protect winners, prune losers, under RAM/disk budgets.
+- Your workload is RL training or agent tree search over many resettable environments.
+
+See the [K7d documentation](/k7d/index) for the runtime's own concepts, API, and benchmarks.
+
+<Note>
+**Cluster fork is a k7d feature, not a k7 feature.** Forking an entire live Kubernetes cluster (~100 ms for a 3-node cluster) is done by the k7d runtime directly, through its own daemon API — see [Cluster mode](/k7d/guides/cluster-mode). k7's `fork` command clones a single sandbox.
+</Note>
+
+## Specifying the backend
+
+### At install time
+
+```bash
+k7 install                                     # default: kata backends on localhost
+k7 install --backend kfd                       # kata-firecracker-devmapper only (auto-detects raw disk)
+k7 install --backend kfd --disk /dev/nvme2n1   # pin the thin-pool disk explicitly
+k7 install --backend kql                       # kata-qemu-longhorn only, no raw disk needed
+k7 install --backend kql --longhorn-extra-disk /mnt/longhorn-extra   # optional extra storage
+k7 install --backend k7d                       # k7d runtime (daemon + shim + RuntimeClass k7)
+k7 install --backend kfd,kql --disk /dev/nvme2n1 --longhorn-extra-disk /mnt/longhorn-extra   # multiple, explicit
+k7 install -i inventory.ini                    # multi-node, per-host backends
+```
+
+### At sandbox creation time
+
+```bash
+# Auto-detect (uses the only backend installed, or falls back to kfd if several)
+k7 create --image alpine:3.20 demo
+
+# Explicit
+k7 create --backend kql --image alpine:3.20 demo
+k7 create --backend k7d --image alpine:3.20 demo
+
+# In YAML
+# k7.yaml:
+backend: kata-qemu-longhorn   # or kata-firecracker-devmapper, k7d — or alias kql / kfd
+```
+
+If the requested backend isn't available on any node, you'll see a clear `FailedScheduling` message listing which backends are.
+
+## Backend-specific behavior
+
+### kata-qemu-longhorn
+
+- Each sandbox gets a Longhorn PVC named `<sandbox>-root-lh`, defaulting to **10Gi** (override with `--root-disk-size 20Gi` or in YAML).
+- The container runs **privileged** to allow the persistence wrapper to bind-mount `/mnt/state` from the PVC.
+- Image base must include `/bin/sh`, `tar`, and `mount` (Debian/Ubuntu/Alpine all work).
+- Image `ENTRYPOINT`+`CMD` are preserved by default — override with `--entrypoint` / `--cmd`.
+- `pause` takes a crash-consistent VolumeSnapshot before scaling to 0 (optional; pass `--snapshot <name>`).
+- `fork` snapshots the source PVC, clones it via Longhorn's CSI VolumeSnapshot+Restore, then creates a new Deployment pointing at the cloned PVC.
+
+### kata-firecracker-devmapper
+
+- Sandbox storage is a per-pod logical volume on the LVM thin-pool — fast to create, lost on delete.
+- The Firecracker process runs **inside the jailer**: a chroot, with dropped capabilities and a restrictive seccomp filter, as an unprivileged UID.
+- No `pause`/`resume`/`fork` — there's no persistent disk to snapshot.
+- `--root-disk-size` has no effect (warned by the CLI).
+
+### k7d
+
+- Pods run as k7d microVMs via `runtimeClassName: k7` — a small containerd shim talks to the `k7d` daemon over `/run/k7d/k7d.sock`.
+- Fork copies the **whole VM**: memory, disk, processes, and network identity — not just the disk. Warm fork is ~5 ms.
+- Multi-vCPU guests are **in progress** — the daemon boots 1 vCPU today; the pod's CPU limit is still enforced host-side via CFS quota.
+- See [RuntimeClass k7](/k7d/guides/runtime-class) for how the runtime is registered, and the [feature matrix](/k7d/guides/feature-matrix) for current Kubernetes feature support.

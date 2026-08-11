@@ -1,0 +1,48 @@
+---
+title: "Feature matrix"
+description: "Kubernetes feature support — inside a forked cluster, and for pods running as k7d VMs"
+---
+
+Two layers — most RL users only care about the first.
+
+## Inside a forked cluster (your GRPO scenario)
+
+This is the k3s that lives *inside* the VMs you fork ([cluster mode](/k7d/guides/cluster-mode)). The fork engine is **N-node** (`tree_create_cluster(vm_count)` / adopt any live set) — there is no hard-coded 3. The CI fixture that proves the headline numbers is a 3-node control plane with flannel + kube-proxy and a real in-cluster Deployment; several stock k3s add-ons are still disabled there to keep that path lean. Status below mixes "API can do it" with "fixture exercises it."
+
+| Feature | Status | Notes |
+|---|---|---|
+| k3s control plane (server + agents) | ✅ Today | Fixture proves 3 Ready nodes; TLS / node IPs survive fork |
+| **N-node clusters** (5, 20, …) | ✅ Today | Same fork path for any `vm_count`; limited by **host RAM**, not by the API. At ~3.2 GiB/node, a 20-node base alone is ~64 GiB — shrink guest memory (or use a bigger box) and it forks like the 3-node case |
+| Flannel (`host-gw`) | ✅ Today | Shared L2 between member VMs |
+| kube-proxy (ClusterIP by IP) | ✅ Today | |
+| Deployments / ReplicaSets / Pods | ✅ Today | e.g. `inner-load` Ready on source *and* fork |
+| ConfigMaps / Secrets (as in-cluster objects) | ✅ Today | Exercised under churn before fork |
+| overlayfs snapshotter (guest containerd) | ✅ Today | |
+| CoreDNS | 🔜 Soon | Disabled in the current fixture; re-enable is next |
+| Traefik / Ingress | 🔜 Soon | Same — disabled today, queued with CoreDNS |
+| ServiceLB / metrics-server | 🔜 Soon | Disabled in the fixture |
+| `local-path` / in-cluster PVC provisioning | 🔜 Soon | Disabled (`local-storage` off) |
+| NetworkPolicy | 🔜 Later | Disabled today (`--disable-network-policy`) |
+| Cilium (eBPF CNI / policies) | 🔜 Later | Not validated inside the guest; outer host may run Cilium |
+| Longhorn / CSI drivers (iSCSI, NFS, …) | 🔜 Later | Guest kernel is minimal; no CSI path yet |
+| Nested `hostNetwork` pods | ❌ Not today | Known failure mode in the guest |
+
+If your scenario needs CoreDNS + Ingress tomorrow, [say so](https://github.com/katakate/k7d/issues) — re-enabling the stock add-ons is the next fidelity bump, not a redesign. Same for a larger CI fixture: wiring 20 nodes is configuration + RAM, not a new fork feature.
+
+## Host RuntimeClass (pods *as* k7d VMs)
+
+This is the outer layer: kubectl on the host schedules pods into k7d microVMs via [`runtimeClassName: k7`](/k7d/guides/runtime-class). Relevant if you also want single-VM sandboxes, not only whole-cluster forks.
+
+| Feature | Status | Notes |
+|---|---|---|
+| `runtimeClassName: k7` (CRI / containerd shim) | ✅ Today | |
+| `kubectl logs` / `exec` / `exec -it` (PTY) | ✅ Today | Incl. resize, Ctrl-C, detach |
+| Pod IP, Services, DNS, egress | ✅ Today | Host CNI dataplane |
+| ConfigMap / Secret / projected / downwardAPI / emptyDir | ✅ Today | |
+| hostPath, local-path PVC, k7d RWO disk volumes | ✅ Today | |
+| Memory / CPU limits; multi-container / sidecars | ✅ Today | |
+| Warm VM + whole-cluster fork / snapshot tree | ✅ Today | The point of the project |
+| Init containers; natural exit / `restartPolicy` | ✅ Today | |
+| Multi-vCPU guests (`cpu: "2"+`) | ✅ Today | vCPU count derived from the pod's CPU limit; fork/snapshot parity |
+| `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | |
+| Cross-node fork | 🔮 Later | Host-local trees today |

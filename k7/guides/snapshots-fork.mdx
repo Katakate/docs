@@ -1,0 +1,150 @@
+---
+title: "Snapshots & fork"
+description: "Pause, resume, and fork sandboxes via crash-consistent VolumeSnapshots"
+---
+
+The `kata-qemu-longhorn` backend supports **disk-level snapshots** of running sandboxes via Longhorn's CSI VolumeSnapshot API. This unlocks three workflows:
+
+- **Pause** — scale to 0 and (optionally) snapshot the disk for safekeeping.
+- **Resume** — scale back to 1; the same disk re-attaches.
+- **Fork** — clone a sandbox's disk into a brand-new sandbox with its own pod, IP, and lifecycle.
+
+<Note>
+These commands require the `kata-qemu-longhorn` backend. The `kata-firecracker-devmapper` backend uses ephemeral devmapper LVs and doesn't support persistent snapshots.
+</Note>
+
+<Note>
+**Looking for memory-faithful or whole-cluster forking?** That's the [k7d runtime](/k7d/index), not k7's Longhorn-based fork. k7d warm-forks a running VM in ~5 ms (memory, disk, processes, and network identity all survive) and can fork an entire live Kubernetes cluster in ~100 ms — see [CoW fork](/k7d/concepts/cow-fork) and [Cluster mode](/k7d/guides/cluster-mode). The fork described on this page is **disk-only**: the clone boots fresh from a copy of the source's disk.
+</Note>
+
+## Anatomy of a `kata-qemu-longhorn` sandbox
+
+When you create a `kata-qemu-longhorn` sandbox, k7 provisions:
+
+- A **Longhorn PVC** named `<sandbox>-root-lh`, sized via `--root-disk-size` (default `10Gi`).
+- A **Deployment** with one replica, mounting the PVC at `/mnt/state` (with persistence wrapper bind-mounts).
+- An ingress-deny `NetworkPolicy` and an egress policy (CIDR or FQDN).
+- An optional `Secret` from `env_file`.
+
+State written to `/mnt/state` (and to the rootfs via the bind-mount overlay) survives pod restarts because it lives on the PVC.
+
+## Pause
+
+```bash
+k7 pause demo                           # scale to 0, no snapshot
+k7 pause demo --snapshot demo-snap-1    # take a VolumeSnapshot, then scale to 0
+```
+
+Optional flags:
+
+- `--pvc PVC_NAME` — explicit PVC to snapshot. Defaults to `<sandbox>-root-lh`.
+- `--snapshot-class CLASS` — `VolumeSnapshotClass`. Defaults to `longhorn` (created by the playbook).
+
+The snapshot is **crash-consistent**: it captures the disk state at the moment of the snapshot, not the in-memory process state. The sandbox process is then terminated as the Deployment scales to 0.
+
+The snapshot is stored as a `VolumeSnapshot` object in the same namespace and persists until you delete it (`kubectl delete volumesnapshot <name>`).
+
+## Resume
+
+```bash
+k7 resume demo
+```
+
+Scales the Deployment back to 1. The pod re-attaches to the same PVC; data on `/mnt/state` is exactly as it was at pause time. If the pause took a snapshot, the snapshot remains available — useful for rollback if the resumed workload corrupts something.
+
+## Fork
+
+```bash
+k7 fork demo demo-clone
+k7 fork demo demo-clone --snapshot custom-name
+```
+
+Fork takes a snapshot of the source sandbox's PVC, **clones it into a new PVC**, and creates a new Deployment pointing at the cloned PVC. Implementation steps:
+
+1. Create a `VolumeSnapshot` of `<source>-root-lh` (auto-named or `--snapshot`).
+2. Wait for `readyToUse: true` on the snapshot.
+3. Create a new PVC `<new>-root-lh` from the snapshot via `dataSource`.
+4. Create a Deployment for the new sandbox using the cloned PVC.
+5. Wait for the new pod to be Ready.
+6. Delete the temporary snapshot (the cloned PVC is independent of it).
+
+**Scope: disk only.** Fork does not clone:
+
+- Memory state (the new sandbox boots fresh)
+- CPU registers / process state
+- Network identity (the fork gets a new pod IP and is subject to its own NetworkPolicy)
+
+## Observed performance
+
+Measured on a single Hetzner dedicated node (3× NVMe, Ubuntu 24.04, Longhorn `replicas=1`) — see [PERFORMANCE.md](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md):
+
+| Operation | Latency | Soft limit |
+|-----------|---------|------------|
+| Cold create → pod ready | **15.2 s** | — |
+| Snapshot ready | 7.0 s | < 60 s |
+| Pause (scale to 0) | 0.13 s | — |
+| Resume (scale to 1 + ready) | 4.5 s | < 60 s |
+| **Fork (total)** | **44.9 s** | < 120 s |
+| — snapshot | 3.0 s | |
+| — clone PVC bound | 2.7 s | |
+| — deployment ready | 39.2 s | |
+
+Fork is roughly 3× slower than a cold create today — most of the time is the cloned PVC's first attach (Longhorn replays cloned data).
+
+## Example: a parallel exploration with fork
+
+A common AI workflow is to set up a heavy environment once, then explore many branches from it.
+
+```python
+from k7_sdk import Client
+
+k7 = Client(endpoint="http://node:31007", api_key="...")
+
+# Step 1: prepare a base sandbox with a big environment
+base = k7.create({
+    "name": "base",
+    "image": "python:3.12-bookworm",
+    "backend": "kata-qemu-longhorn",
+    "root_disk_size": "20Gi",
+    "before_script": (
+        "apt-get update && "
+        "apt-get install -y build-essential && "
+        "pip install torch transformers datasets"
+    ),
+    "egress_whitelist": ["pypi.org", "files.pythonhosted.org", "huggingface.co"],
+})
+
+# (Wait until base is Ready; do whatever setup you want)
+
+# Step 2: fork the base for each parallel experiment
+forks = [base.fork(f"exp-{i}") for i in range(8)]
+for f in forks:
+    f.exec("python -c 'print(\"branch\", __import__(\"os\").getpid())'")
+```
+
+Or from the CLI on a node with API access:
+
+```bash
+for i in $(seq 0 7); do
+  k7 fork base exp-$i &
+done
+wait
+```
+
+Each `exp-N` boots from a clone of `base`'s disk — the heavy `pip install` doesn't run again.
+
+## Cleanup
+
+`k7 delete demo` removes the Deployment, the PVC, and any pause/fork snapshots associated with the sandbox. To inspect what's still around:
+
+```bash
+sudo k3s kubectl get pvc,volumesnapshot -A | grep demo
+sudo k3s kubectl get volumes.longhorn.io,replicas.longhorn.io -n longhorn-system
+```
+
+Integration tests under `tests/integration/` exercise pause/resume/fork end-to-end and detect orphaned Longhorn replicas or stuck PVCs.
+
+## Reference
+
+- Performance baseline: [`PERFORMANCE.md`](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md)
+- Integration tests: [`tests/integration/`](https://github.com/Katakate/k7/tree/main/tests/integration)

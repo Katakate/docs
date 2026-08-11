@@ -1,0 +1,94 @@
+---
+title: "Auth & responses"
+description: "Authentication, base URL, and response format"
+---
+
+Base URL: `https://<your-endpoint>` (see `k7 api status` / `k7 api endpoint`).
+
+## Authentication
+
+Send your API key via either header:
+
+```http
+X-API-Key: <your-key>
+# or
+Authorization: Bearer <your-key>
+```
+
+All endpoints return standard HTTP codes. `401 Unauthorized` if the key is missing/invalid/expired.
+
+## Response envelope
+
+Successful responses:
+
+```json
+{ "data": ... }
+```
+
+Errors:
+
+```json
+{ "error": { "code": "BadRequest", "message": "..." } }
+```
+
+Common error codes:
+
+- `BadRequest` (400): Invalid input or missing parameters
+- `Unauthorized` (401): Missing or invalid API key
+- `NotFound` (404): Resource was not found
+- `Conflict` (409): Resource already exists
+- `UnprocessableEntity` (422): Validation failed
+- `InternalServerError` (500): Unhandled error
+
+## Headers
+
+Required headers for requests with body:
+
+```http
+Content-Type: application/json
+```
+
+Authentication headers (either):
+
+```http
+X-API-Key: <your-key>
+# or
+Authorization: Bearer <your-key>
+```
+
+## Resources
+
+- Sandboxes: create, list, get, delete, delete-all, **pause, resume, fork**
+- Exec: run a command in a sandbox and get stdout/stderr/exit_code
+- Metrics: CPU and memory usage per sandbox
+
+### Endpoints at a glance
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| POST   | `/api/v1/sandboxes`                  | Create sandbox |
+| GET    | `/api/v1/sandboxes`                  | List sandboxes |
+| GET    | `/api/v1/sandboxes/{name}`           | Get one sandbox |
+| DELETE | `/api/v1/sandboxes/{name}`           | Delete one sandbox |
+| DELETE | `/api/v1/sandboxes`                  | Delete all in namespace |
+| POST   | `/api/v1/sandboxes/{name}/exec`      | Run a command, get stdout/stderr/exit |
+| GET    | `/api/v1/sandboxes/{name}/logs`      | Snapshot of pod logs (no streaming yet) |
+| POST   | `/api/v1/sandboxes/{name}/pause`     | Scale to 0, optionally snapshot the PVC |
+| POST   | `/api/v1/sandboxes/{name}/resume`    | Scale back to 1 |
+| POST   | `/api/v1/sandboxes/{name}/fork`      | Clone source into a new sandbox (kata-qemu-longhorn) |
+| POST   | `/api/v1/sandboxes/{name}/snapshot`  | Snapshot a running sandbox without pausing it |
+| GET    | `/api/v1/snapshots`                  | List VolumeSnapshots managed by k7 |
+| GET    | `/api/v1/snapshots/{name}`           | Inspect one VolumeSnapshot |
+| DELETE | `/api/v1/snapshots/{name}`           | Delete a VolumeSnapshot |
+| POST   | `/api/v1/snapshots/{name}/restore`   | Boot a new sandbox from a standalone VolumeSnapshot |
+| POST   | `/api/v1/snapshots/gc`               | Sweep stale `kind=fork` snapshots |
+| GET    | `/api/v1/sandboxes/metrics`          | CPU/memory metrics per sandbox |
+
+<Info>
+Health endpoints:
+
+- `GET /` → basic API info
+- `GET /health` → health check
+</Info>
+
+

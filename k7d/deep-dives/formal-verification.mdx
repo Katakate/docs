@@ -1,0 +1,41 @@
+---
+title: "Formal verification"
+description: "Kani bounded model checking and Aeneas→Lean proofs on the paths where they pay off"
+---
+
+k7d uses formal methods **where they pay off** — selected critical pieces are machine-checked, not the whole runtime. This is deliberately not a claim that "k7d is proven correct"; it is a claim that the two most consequence-laden pieces of logic have proofs attached, and that those proofs run in CI.
+
+| Tool | What it covers |
+|---|---|
+| [Kani](https://model-checking.github.io/kani/) | Bounded proofs over selected `unsafe` / address-arithmetic harnesses |
+| [Aeneas](https://aeneasverif.github.io/) → Lean | Functional correctness of the snapshot-tree budget / LRU eviction model |
+
+## Kani: the unsafe and arithmetic paths
+
+A VMM is a machine for doing address arithmetic next to `unsafe` blocks: guest-physical to host-virtual translation, initrd placement, GDT encoding, page-table entries, dirty-bitmap indexing. A single off-by-one silently corrupts a guest.
+
+[Kani](https://model-checking.github.io/kani/) is a bounded model checker for Rust: it explores **every input within a bound** and proves no panic, overflow, or out-of-bounds access occurs. Proof harnesses are co-located with the code they verify (`#[cfg(kani)]` modules with `#[kani::proof]` functions at the bottom of the VM, fork, snapshot, and device modules).
+
+```bash
+make kani     # run the harnesses (minutes, not hours)
+```
+
+Complementing Kani, every `unsafe` block carries a `// SAFETY:` comment (lint-enforced), Miri runs over the non-KVM unit tests, and libFuzzer runs over the agent protocol and virtio-blk request parsing.
+
+## Aeneas → Lean: the tree budget model
+
+The [snapshot tree](/k7d/concepts/snapshot-tree)'s budget and eviction bookkeeping decides which VMs live, which get suspended, and which state gets deleted. A bookkeeping bug here means OOM-ing the host or evicting a protected winner mid-training-run.
+
+That logic is factored into a pure, side-effect-free Rust module. [Aeneas](https://aeneasverif.github.io/) (via [Charon](https://github.com/AeneasVerif/charon)) translates it to [Lean](https://lean-lang.org/), where theorems about the model — budget invariants, eviction ordering, protection being honored — are proved and re-checked whenever the model changes:
+
+```bash
+make verif-gen verif-build     # regenerate the Lean model + build the proofs
+```
+
+The translation is guarded: any Rust primitive that Aeneas cannot model lands in the generated Lean as a bodyless axiom, and the build **fails** if an axiom appears that is not on an explicit allowlist. New unprovable constructs must be refactored away rather than silently assumed.
+
+## What is *not* verified
+
+Everything else: the virtio device implementations, the KVM run loop, the network dataplane, the shim, the agent. Those rely on the conventional arsenal — the type system, integration tests with [enforced latency budgets](/k7d/deep-dives/benchmarks), fuzzing, Miri, and a deliberately small codebase (≤25k lines for VMM + shim).
+
+See the repo's [verification setup](https://github.com/katakate/k7d/tree/main/verif) for the Lean sources and axiom allowlist.

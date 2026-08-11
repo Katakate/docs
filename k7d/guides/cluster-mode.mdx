@@ -1,0 +1,58 @@
+---
+title: "Cluster mode"
+description: "Create, adopt, and fork whole multi-VM Kubernetes clusters as one unit"
+---
+
+Cluster mode is what makes k7d different from every sandbox runtime: the unit of fork is not a VM but a **set of VMs sharing a network** — typically a k3s control plane plus agents. A cluster fork copies every member VM *and* replays their network identities onto a fresh bridge, so the copied cluster keeps running without a restart. See [Network identity](/k7d/concepts/network-identity) for why that works.
+
+## Two ways to get a cluster tree
+
+### 1. Create one from scratch — `tree_create_cluster`
+
+```json
+{"op": "tree_create_cluster", "vm_count": 3, "config": {"memory_mb": 1024}}
+```
+
+The daemon boots `vm_count` member VMs on a tree-owned bridge and roots a cluster snapshot tree at them. The fork engine is **N-node** — there is no hard-coded 3. The per-member `config` is a regular `VmConfig` (its `network` field must be omitted: the tree creates and owns its own cluster network).
+
+Practical sizing: at ~3.2 GiB per k3s node, a 20-node base alone is ~64 GiB. The limit is **host RAM**, not the API — shrink guest memory or use a bigger box, and a 20-node cluster forks the same way the 3-node one does.
+
+### 2. Adopt live VMs — `tree_adopt_cluster`
+
+```json
+{"op": "tree_adopt_cluster", "vm_ids": ["vm-1", "vm-2", "vm-3"]}
+```
+
+Takes sandbox VMs the daemon already owns (e.g. pods deployed via [RuntimeClass k7](/k7d/guides/runtime-class) with a shared `cluster-id` annotation) and converts them into a cluster tree root. The VMs must already share one cluster bridge — same `cluster_id`, distinct `vm_index`es covering `0..N-1`.
+
+Adoption fails loud on any half-wired state (missing VM, mixed bridges, non-contiguous indices, already tree-owned). Validation failures put the VMs back untouched; a failure after extraction tears everything down — no half-adopted state survives.
+
+<Note>
+Setting up a k3s cluster *inside* the VMs is your scenario's job (boot k3s server + agents, wait for Ready). k7d gives you the fork; the integration tests and the demo show a working 3-node k3s fixture end to end.
+</Note>
+
+## Forking, suspending, resuming a cluster
+
+Once rooted, a cluster tree uses the same verbs as a single-VM tree — every operation applies to **all members as one unit**:
+
+```json
+{"op": "tree_fork", "tree_id": "t1", "source_id": "root", "label": "branch-a"}
+{"op": "tree_fork_batch", "tree_id": "t1", "source_id": "root", "labels": ["b0", "b1", "b2", "b3"]}
+{"op": "tree_suspend", "tree_id": "t1", "node_id": "branch-a"}
+{"op": "tree_resume", "tree_id": "t1", "node_id": "branch-a"}
+```
+
+Responses carry one `guest_cids` entry per member (ordered by `vm_index`), so your harness can dial each member's agent. Batch cluster forks run sequential warm forks — each branch gets its own bridge.
+
+The `fork_memory_full_copy` flags in fork responses tell you whether each member forked CoW (`false`, the expected fast path) or had to fall back to a full memory copy (`true` — happens only for virtiofs-backed sources, e.g. pods with read-write hostPath mounts).
+
+## What the numbers look like
+
+| Operation | Typical | Enforced budget |
+|---|---|---|
+| Warm fork of a live 3-node k3s cluster (under API churn) | ~105 ms | 1 s |
+| On-host 3-VM cluster warm fork (busybox) | ~25–40 ms quiet | 150 ms |
+| 50× 3-VM cluster-tree forks (shared pause) | ~4.1 s (~82 ms/cluster) | 20 s |
+| Cluster-tree suspend / resume (3 VMs) | ~25 ms / ~40 ms | 750 ms each |
+
+Methodology and reproduction commands: [Benchmarks](/k7d/deep-dives/benchmarks). What works inside a forked cluster today (CoreDNS, Ingress, NetworkPolicy, …): [Feature matrix](/k7d/guides/feature-matrix).

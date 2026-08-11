@@ -1,0 +1,351 @@
+---
+title: "Sandboxes"
+description: "Create, list, get, and delete sandboxes"
+---
+
+## Create sandbox
+
+Endpoint: `POST /api/v1/sandboxes`
+
+<RequestExample>
+```bash cURL
+curl -X POST "$BASE/api/v1/sandboxes" \
+  -H "X-API-Key: $K7_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-sandbox",
+    "image": "alpine:latest",
+    "namespace": "default",
+    "limits": {"cpu": "500m", "memory": "512Mi"}
+  }'
+```
+</RequestExample>
+
+Body example:
+
+```json
+{
+  "name": "my-sandbox",
+  "image": "alpine:latest",
+  "namespace": "default",
+  "limits": {"cpu": "500m", "memory": "512Mi"}
+}
+```
+
+Body example with egress whitelist (safe pattern: proxy IP only):
+
+```json
+{
+  "name": "my-restricted-sandbox",
+  "image": "alpine:latest",
+  "namespace": "default",
+  "egress_whitelist": ["10.0.0.5/32"],
+  "limits": {"cpu": "500m", "memory": "512Mi"}
+}
+```
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "name": "my-sandbox",
+    "namespace": "default",
+    "image": "alpine:latest"
+  }
+}
+```
+</ResponseExample>
+
+### Request body schema
+
+Fields accepted in the JSON body when creating a sandbox:
+
+- `name` (string, required): Unique sandbox name in the namespace
+- `image` (string, required): Container image, e.g. `alpine:latest`
+- `namespace` (string, default `default`): Kubernetes namespace
+- `env_file` (string | null): Path (on API host) to `.env` file to inject as Secret
+- `before_script` (string, default empty): Shell commands to run before the container is marked Ready
+- `limits` (object): Resource limits/requests; keys supported: `cpu`, `memory`, `ephemeral-storage`
+- `egress_whitelist` (string[] | [] | null): See Egress section below
+- `pod_non_root` (boolean, default false): Run pod as non-root (UID/GID/FSGroup 65532)
+- `container_non_root` (boolean, default false): Run container as non-root (UID 65532)
+- `cap_drop` (string[] | null): List of capabilities to drop; default policy is `ALL`
+- `cap_add` (string[] | null): List of capabilities to add back
+
+### Responses
+
+- `201 Created` with Location header to the created resource:
+
+```json
+{ "data": { "name": "my-sandbox", "namespace": "default", "image": "alpine:latest" } }
+```
+
+- `400 BadRequest` when validation fails (invalid limits, bad env file, already exists, etc.)
+
+
+## List sandboxes
+
+Endpoint: `GET /api/v1/sandboxes`
+
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -H "X-API-Key: $K7_API_KEY" "$BASE/api/v1/sandboxes?namespace=default"
+```
+</RequestExample>
+
+Returns list of sandbox objects with fields: name, namespace, status, ready, restarts, age, image, error_message.
+
+<ResponseExample>
+```json Success
+{
+  "data": [
+    {
+      "name": "my-sandbox",
+      "namespace": "default",
+      "status": "Running",
+      "ready": "True",
+      "restarts": 0,
+      "age": "0:05:42",
+      "image": "alpine:latest",
+      "error_message": ""
+    }
+  ]
+}
+```
+</ResponseExample>
+
+## Get sandbox
+
+Endpoint: `GET /api/v1/sandboxes/{name}`
+
+<ParamField path="name" type="string" required>Sandbox name</ParamField>
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -H "X-API-Key: $K7_API_KEY" "$BASE/api/v1/sandboxes/my-sandbox?namespace=default"
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "name": "my-sandbox",
+    "namespace": "default",
+    "status": "Running",
+    "ready": "True",
+    "restarts": 0,
+    "age": "0:05:42",
+    "image": "alpine:latest",
+    "error_message": ""
+  }
+}
+```
+</ResponseExample>
+
+## Delete sandbox
+
+Endpoint: `DELETE /api/v1/sandboxes/{name}`
+
+<ParamField path="name" type="string" required>Sandbox name</ParamField>
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -X DELETE -H "X-API-Key: $K7_API_KEY" \
+  "$BASE/api/v1/sandboxes/my-sandbox?namespace=default"
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{ "data": { "message": "Sandbox my-sandbox deleted successfully" } }
+```
+</ResponseExample>
+
+## Delete all sandboxes
+
+Endpoint: `DELETE /api/v1/sandboxes`
+
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -X DELETE -H "X-API-Key: $K7_API_KEY" \
+  "$BASE/api/v1/sandboxes?namespace=default"
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "message": "Deleted 1 sandboxes",
+    "results": [ { "name": "my-sandbox", "success": true, "error": null } ]
+  }
+}
+```
+</ResponseExample>
+
+<Warning>
+Deleting sandboxes is irreversible.
+</Warning>
+
+## Get logs
+
+Endpoint: `GET /api/v1/sandboxes/{name}/logs`
+
+Returns a snapshot of the pod's container logs. Live `follow` streaming
+isn't shipped yet — use `k7 --core logs --follow ...` on a cluster node
+for tail-and-follow until a future spec adds streaming.
+
+<ParamField path="name" type="string" required>Sandbox name</ParamField>
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+<ParamField query="container" type="string" default="sandbox">Container name inside the pod</ParamField>
+<ParamField query="tail" type="int" default="200">Number of trailing lines to return</ParamField>
+<ParamField query="since" type="int" default="0">Only return entries newer than N seconds (0 = no filter)</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -H "X-API-Key: $K7_API_KEY" \
+  "$BASE/api/v1/sandboxes/demo/logs?tail=100"
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{ "data": { "logs": "first line\nsecond line\n..." } }
+```
+</ResponseExample>
+
+Responses:
+
+- `200 OK` with `{"data": {"logs": "..."}}` on success.
+- `404 NotFound` when no pod matches the sandbox name in the namespace.
+
+## Pause sandbox
+
+Endpoint: `POST /api/v1/sandboxes/{name}/pause`
+
+Scales the sandbox Deployment to 0 and optionally creates a Longhorn
+`VolumeSnapshot` of its root PVC for crash-consistent state capture
+(kata-qemu-longhorn only).
+
+<ParamField path="name" type="string" required>Sandbox name</ParamField>
+
+Body (all keys optional):
+
+```json
+{
+  "namespace": "default",
+  "snapshot": "demo-v1"
+}
+```
+
+When `snapshot` is set, the API snapshots the sandbox's root PVC under
+that name using the `longhorn` `VolumeSnapshotClass`. The PVC name is
+derived server-side (`<sandbox>-root-lh` for kata-qemu-longhorn) — there is
+no client-side flag for it. Without `snapshot` the endpoint only scales
+to 0 without taking a snapshot.
+
+<RequestExample>
+```bash cURL
+curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/sandboxes/demo/pause" \
+  -d '{"snapshot":"demo-v1"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{ "data": { "message": "Sandbox demo paused (replicas=0). Snapshot demo-v1 created." } }
+```
+</ResponseExample>
+
+## Resume sandbox
+
+Endpoint: `POST /api/v1/sandboxes/{name}/resume`
+
+Scales the Deployment back to 1.
+
+<ParamField path="name" type="string" required>Sandbox name</ParamField>
+
+Body:
+
+```json
+{ "namespace": "default" }
+```
+
+<RequestExample>
+```bash cURL
+curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/sandboxes/demo/resume" -d '{}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{ "data": { "message": "Sandbox demo resumed (replicas=1)." } }
+```
+</ResponseExample>
+
+## Fork sandbox
+
+Endpoint: `POST /api/v1/sandboxes/{name}/fork`
+
+Clones a kata-qemu-longhorn sandbox into a new name with its own disk derived
+from a fresh `VolumeSnapshot` of the source's root PVC. The request blocks
+until the new PVC is bound (typically ~45 s today). Fork is kata-qemu-longhorn
+only — fork on a `kata-firecracker-devmapper` sandbox returns 400.
+
+<ParamField path="name" type="string" required>Source sandbox name</ParamField>
+
+Body:
+
+```json
+{
+  "new_name": "demo-clone",
+  "namespace": "default",
+  "snapshot": "optional-temp-snap-name"
+}
+```
+
+`new_name` is required. `snapshot` is an optional name for the
+fork-time intermediate snapshot; if omitted, k7 picks one.
+
+<RequestExample>
+```bash cURL
+curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/sandboxes/demo/fork" \
+  -d '{"new_name":"demo-clone"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "name": "demo-clone",
+    "namespace": "default",
+    "source": "demo",
+    "message": "Forked sandbox demo -> demo-clone with cloned disk (PVC demo-clone-root-lh from snapshot demo-to-demo-clone-snap) in 44.92s"
+  }
+}
+```
+</ResponseExample>
+
+Responses:
+
+- `201 Created` with `Location: /api/v1/sandboxes/{new_name}?namespace={namespace}`
+- `400 BadRequest` when `new_name` is missing, or the source backend doesn't support fork
+- `404 NotFound` when the source Deployment or its root PVC is missing
+- `409 Conflict` when `new_name` already exists in the namespace
+
+## See also
+
+- API Security & networking: `/api/security`
+
+

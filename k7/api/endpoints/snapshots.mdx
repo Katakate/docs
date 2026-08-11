@@ -1,0 +1,231 @@
+---
+title: "Snapshots"
+description: "Inspect, create, delete and GC VolumeSnapshots (Spec 10e)"
+---
+
+k7 creates Kubernetes `VolumeSnapshot` objects in three situations:
+
+| Kind     | Created by                                          | Default name                      | Lifetime                                  |
+| -------- | --------------------------------------------------- | --------------------------------- | ----------------------------------------- |
+| `pause`  | `POST /api/v1/sandboxes/{name}/pause` with snapshot | `<sandbox>-paused-<unix>`         | Persistent — until you delete it.         |
+| `fork`   | `POST /api/v1/sandboxes/{name}/fork` (no snapshot)  | `<source>-fork-<unix>`            | Auto-deleted inline once the clone PVC binds; the GC CronJob sweeps any leftovers older than 10 min. |
+| `named`  | `POST /api/v1/sandboxes/{name}/snapshot` *or* fork with `snapshot` body field | user-supplied | Persistent — until you delete it.         |
+
+Each snapshot carries `k7.io/kind` and `k7.io/source-sandbox` annotations so list / GC don't have to guess from the name.
+
+## List snapshots
+
+Endpoint: `GET /api/v1/snapshots`
+
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+<ParamField query="all_namespaces" type="boolean" default="false">List across all namespaces</ParamField>
+<ParamField query="sandbox" type="string">Filter to snapshots tied to a sandbox</ParamField>
+<ParamField query="kind" type="string">`pause`, `fork`, or `named`</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -H "X-API-Key: $K7_API_KEY" \
+  "$BASE/api/v1/snapshots?namespace=default&sandbox=demo"
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": [
+    {
+      "name": "demo-paused-1700000000",
+      "namespace": "default",
+      "source_pvc": "demo-root-lh",
+      "source_sandbox": "demo",
+      "kind": "pause",
+      "ready_to_use": true,
+      "creation_timestamp": "2026-05-17T09:42:00Z",
+      "age": "0:05:42",
+      "size_bytes": 10737418240,
+      "snapshot_class": "longhorn"
+    }
+  ]
+}
+```
+</ResponseExample>
+
+## Inspect one snapshot
+
+Endpoint: `GET /api/v1/snapshots/{name}`
+
+<ParamField path="name" type="string" required>Snapshot name</ParamField>
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+
+Returns the same shape as one element of the list endpoint, or `404` if not found.
+
+## Create a `named` snapshot
+
+Endpoint: `POST /api/v1/sandboxes/{name}/snapshot`
+
+Snapshots a running sandbox's root PVC **without pausing it**. The PVC name is derived server-side (`<sandbox>-root-lh` for kata-qemu-longhorn); the resulting snapshot is annotated `k7.io/kind=named` so the GC sweep leaves it alone.
+
+<ParamField path="name" type="string" required>Source sandbox name</ParamField>
+
+Body:
+
+```json
+{
+  "snapshot_name": "demo-experiment-1",
+  "namespace": "default"
+}
+```
+
+<RequestExample>
+```bash cURL
+curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/sandboxes/demo/snapshot" \
+  -d '{"snapshot_name":"demo-experiment-1"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "name": "demo-experiment-1",
+    "namespace": "default",
+    "source_sandbox": "demo"
+  }
+}
+```
+</ResponseExample>
+
+- `201 Created` with `Location: /api/v1/snapshots/{name}?namespace={namespace}` on success.
+- `400 BadRequest` when `snapshot_name` is missing.
+- `409 Conflict` when the name already exists in the namespace.
+
+## Restore a sandbox from a snapshot
+
+Endpoint: `POST /api/v1/snapshots/{name}/restore`
+
+Boots a **brand-new sandbox** from a standalone `VolumeSnapshot` without
+needing the original sandbox's Deployment to still exist. Useful for "thaw
+this paused snapshot from last week" flows where the source has been
+deleted in the meantime.
+
+<ParamField path="name" type="string" required>Snapshot name</ParamField>
+
+Body:
+
+```json
+{
+  "new_sandbox_name": "demo-restored",
+  "namespace": "default",
+  "overrides": {
+    "image": "python:3.12-slim",
+    "root_disk_size": "20Gi",
+    "limits": {"cpu": "2", "memory": "4Gi"},
+    "sidecar": "docker"
+  },
+  "keep_snapshot": true
+}
+```
+
+- `new_sandbox_name` (required) — name for the restored sandbox.
+- `overrides` (optional) — any combination of `image`, `backend`,
+  `root_disk_size`, `sidecar`, `limits`, `entrypoint`, `cmd`,
+  `before_script`. Each override wins over the snapshot's
+  `k7.io/source-*` annotation; fields not supplied fall back to the
+  annotation. **`image` is the only field with no safe default** —
+  restore fails with a clear error if the snapshot lacks
+  `k7.io/source-image` *and* no override is supplied.
+- `keep_snapshot` (default `true`) — when `false`, deletes the source
+  snapshot once the new sandbox is Ready. Useful for "thaw and discard".
+
+<RequestExample>
+```bash cURL
+curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/snapshots/demo-paused-1700000000/restore" \
+  -d '{"new_sandbox_name":"demo-restored"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "name": "demo-restored",
+    "namespace": "default",
+    "source_snapshot": "demo-paused-1700000000",
+    "message": "Sandbox demo-restored restored from snapshot demo-paused-1700000000"
+  }
+}
+```
+</ResponseExample>
+
+Responses:
+
+- `201 Created` with `Location: /api/v1/sandboxes/{new_sandbox_name}?namespace={namespace}` on success.
+- `400 BadRequest` when `new_sandbox_name` is missing, the snapshot lacks `k7.io/source-image` and no override supplied, or the rehydrated backend isn't `kata-qemu-longhorn`.
+- `404 NotFound` when the snapshot doesn't exist in the namespace.
+- `409 Conflict` when `new_sandbox_name` already exists.
+
+Restore is **kata-qemu-longhorn-only** (kata-firecracker-devmapper has no PVC to clone from). When the snapshot's `k7.io/source-backend` annotation says `kata-firecracker-devmapper`, the API returns 400.
+
+## Delete a snapshot
+
+Endpoint: `DELETE /api/v1/snapshots/{name}`
+
+<ParamField path="name" type="string" required>Snapshot name</ParamField>
+<ParamField query="namespace" type="string" default="default">Namespace</ParamField>
+
+<RequestExample>
+```bash cURL
+curl -X DELETE -H "X-API-Key: $K7_API_KEY" \
+  "$BASE/api/v1/snapshots/demo-experiment-1?namespace=default"
+```
+</RequestExample>
+
+Returns `200 OK` on success, `404` when the snapshot is absent.
+
+## Garbage-collect fork snapshots
+
+Endpoint: `POST /api/v1/snapshots/gc`
+
+Sweeps `kind=fork` snapshots older than `keep_fork_for`. **Never touches** pause or named snapshots — anything the user named survives.
+
+Body (all keys optional):
+
+```json
+{
+  "namespace": "default",
+  "all_namespaces": false,
+  "keep_fork_for": "10m",
+  "dry_run": false
+}
+```
+
+`keep_fork_for` accepts `10m` / `2h` / `45s` or a plain integer (seconds).
+
+<RequestExample>
+```bash cURL
+curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/snapshots/gc" \
+  -d '{"all_namespaces": true, "keep_fork_for": "10m"}'
+```
+</RequestExample>
+
+<ResponseExample>
+```json Success
+{
+  "data": {
+    "message": "GC deleted 3 fork snapshot(s)",
+    "results": [
+      { "name": "demo-fork-1700000000", "namespace": "default", "age": "0:25:14", "deleted": true },
+      { "name": "demo-fork-1700001000", "namespace": "default", "age": "0:08:39", "deleted": true },
+      { "name": "exp-fork-1700002000", "namespace": "team-a",  "age": "0:15:02", "deleted": true }
+    ]
+  }
+}
+```
+</ResponseExample>
+
+## Auto-GC mechanics
+
+`k7 fork` deletes its auto-named `kind=fork` snapshot inline as soon as the cloned PVC reaches `Bound`. A backstop **CronJob** (`k7-snapshot-gc` in `kube-system`) runs `python -m k7.api.snapshot_gc` every 10 minutes and cleans up anything the inline path missed — for example after a `k7-api` pod restart mid-fork. The CronJob runs cluster-wide and uses the same ServiceAccount as the API.

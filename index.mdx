@@ -1,0 +1,100 @@
+---
+title: Katakate
+sidebarTitle: Projects
+mode: wide
+keywords:
+  - Katakate
+  - K7
+  - k7d
+  - sandbox
+  - microVM
+  - cluster fork
+  - VMM
+---
+
+export const Tag = ({ children, bg = '#333', color = '#fff' }) => (
+  <span style={{
+    display: 'inline-block',
+    padding: '2px 8px',
+    margin: '2px 4px 2px 0',
+    fontSize: '11px',
+    fontWeight: 600,
+    lineHeight: '18px',
+    borderRadius: '12px',
+    backgroundColor: bg,
+    color,
+  }}>{children}</span>
+);
+
+<div id="home-landing-root">
+<Frame>
+  <img
+    src="/cover.png"
+    alt="Katakate"
+    style={{
+      width: '100%',
+      height: 'auto',
+      maxHeight: 'min(38vh, 400px)',
+      objectFit: 'cover',
+      display: 'block',
+      borderRadius: '0.5rem',
+    }}
+  />
+</Frame>
+</div>
+
+# Projects
+
+Documentation for Katakate projects — K7 sandbox orchestration and the k7d VM runtime.
+
+<CardGroup cols={2}>
+<Card title="K7" icon="/k7/images/k7-logo.png" href="/k7/index">
+<img src="https://img.shields.io/github/stars/Katakate/k7?style=flat&logo=github&label=stars&color=ef672b&logoColor=white" alt="stars" height="16" style={{borderRadius: '8px'}} />
+
+Secure forkable VM sandboxed compute for AI agents and workloads.
+
+<p>
+<Tag bg="#ef672b">Kubernetes</Tag>
+<Tag bg="#ef672b">Firecracker</Tag>
+<Tag bg="#ef672b">Kata</Tag>
+<Tag bg="#ef672b">QEMU</Tag>
+<Tag bg="#ef672b">K3s</Tag>
+<Tag bg="#ef672b">Longhorn</Tag>
+<Tag bg="#ef672b">Cilium</Tag>
+<Tag bg="#ef672b">Ansible</Tag>
+</p>
+<p>
+<Tag bg="#16a34a">code execution</Tag>
+<Tag bg="#16a34a">sandboxing</Tag>
+<Tag bg="#16a34a">Docker in VM</Tag>
+</p>
+<p>
+<Tag bg="#5b3a8a">Python</Tag>
+</p>
+
+[GitHub →](https://github.com/Katakate/k7)
+</Card>
+<Card title="K7d" icon="/k7d/k7d-logo.png" href="/k7d/index">
+<img src="https://img.shields.io/github/stars/katakate/k7d?style=flat&logo=github&label=stars&color=ef672b&logoColor=white" alt="stars" height="16" style={{borderRadius: '8px'}} />
+
+A purpose-built Rust VMM: fork a running Kubernetes cluster in ~100 ms, or a single VM in ~5 ms.
+
+<p>
+<Tag bg="#ef672b">KVM</Tag>
+<Tag bg="#ef672b">virtio</Tag>
+<Tag bg="#ef672b">containerd</Tag>
+<Tag bg="#ef672b">K3s</Tag>
+<Tag bg="#ef672b">Aeneas</Tag>
+</p>
+<p>
+<Tag bg="#16a34a">cluster fork</Tag>
+<Tag bg="#16a34a">snapshot tree</Tag>
+<Tag bg="#16a34a">RL environments</Tag>
+</p>
+<p>
+<Tag bg="#5b3a8a">Rust</Tag>
+</p>
+
+[GitHub →](https://github.com/katakate/k7d)
+</Card>
+</CardGroup>

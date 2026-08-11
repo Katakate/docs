@@ -1,0 +1,60 @@
+---
+title: "Snapshot tree"
+description: "Forks live in a daemon-managed tree with RAM/disk budgets and LRU eviction"
+---
+
+Forks are not free-floating: the daemon organizes them in a **snapshot tree**, where each child is a delta against its parent. This is the shape RL exploration wants — branch the environment at decision points, explore each branch independently, keep the winners, prune the losers:
+
+```text
+base cluster ──► fork A ──► fork A1   (protected: winner)
+             ├─► fork B                (pruned: low reward)
+             └─► fork C ──► rollback ─► fork C'
+```
+
+A tree's payload is either a **single VM** or a **whole cluster** (N member VMs forked, suspended, and resumed as one unit — see [Cluster mode](/k7d/guides/cluster-mode)).
+
+## Node lifecycle
+
+| Operation | What it does |
+|---|---|
+| `tree_create` / `tree_create_cluster` / `tree_adopt_cluster` | Root a tree at a freshly booted VM, a fresh N-VM cluster, or live VMs the daemon already owns |
+| `tree_fork` / `tree_fork_batch` | Fork one or N branches from a live or suspended node. Batch forks share one dirty-bitmap capture |
+| `tree_rollback` | Non-destructive: create a new branch from an earlier node's state |
+| `tree_suspend` | Write a node's delta to disk and free its RAM |
+| `tree_resume` | Bring a suspended node back live (members get fresh vsock CIDs, returned in the response) |
+| `tree_protect` / `tree_unprotect` | Exclude / re-include a node from auto-eviction |
+| `tree_prune` | Delete a node and its whole subtree, disk included |
+| `tree_auto_evict` | Run budget-driven LRU eviction now |
+| `tree_drop` | Forget a tree: live payloads torn down, on-disk state kept |
+
+Full request/response shapes: [Daemon API](/k7d/api/protocol).
+
+## Budgets
+
+The agent decides what to keep; k7d enforces budgets so the tree doesn't eat the machine. Every tree carries a `TreeBudget`:
+
+| Field | Meaning |
+|---|---|
+| `max_live_vms` | Max concurrent live VMs |
+| `max_live_ram_bytes` | Max non-reclaimable RAM across live VMs |
+| `max_disk_bytes` | Max disk usage for base snapshots + deltas across all nodes |
+| `max_chain_depth` | Max parent chain depth before consolidation (recommended: 1) |
+
+When a `tree_create*` request omits the budget, the daemon applies a documented default sized for a node running a handful of 256 MiB guests: 8 live VMs, 8 GiB RAM, 32 GiB disk, chain depth 1.
+
+## LRU eviction
+
+Under budget pressure, the daemon **suspends** the least-recently-active unprotected nodes: their delta goes to disk and their RAM is freed. Suspended nodes can be resumed later. Proactive suspension kicks in at 85% of the RAM budget — kept well below OOM territory and kernel reclaim stalls.
+
+`tree_protect` pins a node (a winner you cannot afford to lose) so budget pressure can't touch it. Eviction never deletes state — only `tree_prune` does.
+
+The budget/eviction bookkeeping is one of the two formally verified pieces of k7d: the model is translated to Lean via Aeneas and its invariants are machine-checked. See [Formal verification](/k7d/deep-dives/formal-verification).
+
+## Node metadata
+
+`tree_nodes` returns every node's metadata (`NodeInfo`): id, parent, children, state, label, `dirty_page_count` (pages this node's delta captures; Σ over members for a cluster), `has_base_snapshot` (whether the node has its own full memory image — a checkpoint / fork-point), `created_at_unix`, `last_active_at_unix` (what LRU ranks on), `protected`, payload `kind` (`Vm` or `Cluster`), and `vm_count`.
+
+## Related pages
+
+- [GRPO / tree search](/k7d/guides/grpo) — the workflow this design serves
+- [CoW fork](/k7d/concepts/cow-fork) — what a "delta" physically is

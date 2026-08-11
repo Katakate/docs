@@ -1,0 +1,108 @@
+---
+title: "Networking"
+description: "Cilium, ingress isolation, and FQDN-aware egress whitelists"
+---
+
+Katakate gives every sandbox its own VM-level network namespace and applies opinionated network policies on top. This page explains the model.
+
+## CNI plugin: Cilium by default
+
+By default, K3s is installed with **Flannel disabled** (`--flannel-backend=none --disable-network-policy`) and **Cilium** as the CNI. Cilium runs with `kubeProxyReplacement=true` (no kube-proxy), and its eBPF datapath attaches to the host-side veth — including for Kata VMs, whose virtio NICs are bridged to a host veth.
+
+```bash
+# Cilium is the default
+k7 install                       # Cilium
+
+# Opt out (CIDR-only egress, no FQDN policies)
+k7 install --cni flannel
+```
+
+When the cluster is on Cilium, k7 uses **`CiliumNetworkPolicy`** for FQDN egress. On Flannel it falls back to the standard Kubernetes **`NetworkPolicy`** with CIDR-only `ipBlock` rules.
+
+## Ingress isolation (always on)
+
+A `NetworkPolicy` blocks **all inter-VM ingress traffic by default**. Practical implications:
+
+- **Sandbox-to-sandbox networking is denied** — even within the same namespace.
+- **`kubectl exec` and `k7 shell` still work** — they go through the Kubernetes API, not pod networking.
+- **`kube-system` traffic is allowed** — needed for cluster services (DNS, metrics, etc.).
+- **No configuration required** — this is enforced for every sandbox.
+
+## Egress control
+
+Egress is configured per sandbox with `egress_whitelist`:
+
+| Value | Behavior |
+|-------|----------|
+| Field omitted (or `null`) | Egress fully open — sandbox can reach the internet |
+| `[]` (empty list) | Egress fully blocked. **DNS is also blocked.** |
+| `["10.0.0.0/8", "1.1.1.1/32"]` | CIDR allowlist. DNS is blocked unless explicitly whitelisted. |
+| `["api.openai.com", "*.huggingface.co"]` | **FQDN allowlist** (requires Cilium). DNS to cluster CoreDNS is auto-allowed and proxied by Cilium so FQDN matching works. |
+| Mixed CIDRs and FQDNs | Both kinds combined into a single `CiliumNetworkPolicy`. |
+
+### How FQDN egress works under Cilium
+
+When the whitelist contains FQDNs, k7 creates a `CiliumNetworkPolicy` like:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: <sandbox>-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      katakate.org/sandbox: <sandbox>
+  egress:
+    # Cluster DNS, with rule that observes lookups for FQDN matching
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": kube-system
+            "k8s:k8s-app": kube-dns
+      toPorts:
+        - ports: [{ port: "53", protocol: ANY }]
+          rules:
+            dns: [{ matchPattern: "*" }]
+    # FQDN allowlist
+    - toFQDNs:
+        - matchName: "api.openai.com"
+        - matchPattern: "*.huggingface.co"
+    # Optional CIDR additions
+    - toCIDR:
+        - "10.0.0.5/32"
+```
+
+Wildcards (`*.example.com`) are supported via Cilium's `matchPattern`. Bare exact names use `matchName`.
+
+### When DNS is blocked
+
+If the whitelist is `[]` or contains only CIDRs, DNS resolution is **denied** by the policy. To work around this:
+
+- Pre-resolve names in `before_script` (which runs **before** the egress policy is applied).
+- Embed your dependencies into the image rather than fetching them at runtime.
+- Whitelist your own internal DNS server / egress proxy and resolve there.
+
+<Warning>
+**Do not whitelist public DNS resolvers** like `1.1.1.1` or `8.8.8.8` — that re-enables DNS-over-UDP/TCP/443 (DoH) and defeats the lockdown. Prefer a single egress proxy IP and enforce DNS / DoH policy at the proxy. Or, even simpler, just use FQDN egress on Cilium.
+</Warning>
+
+## Network policies created per sandbox
+
+For each sandbox, k7 creates:
+
+1. An **ingress-deny** `NetworkPolicy` (always).
+2. **Either**:
+   - A `NetworkPolicy` with CIDR-only `ipBlock` egress rules (when only CIDRs are listed, **or** the cluster runs Flannel), **or**
+   - A `CiliumNetworkPolicy` for FQDN+CIDR egress (when FQDNs are present and Cilium is installed).
+
+All policies are deleted with the sandbox.
+
+## Administrative access
+
+`kubectl exec`, `k7 shell`, the API's `/exec` endpoint, and `k7 logs` all bypass network policies because they ride the Kubernetes API. Pod networking restrictions never affect operator access.
+
+## Multi-node considerations
+
+- Cilium routes pod traffic across nodes natively (no Flannel VXLAN).
+- `CiliumNetworkPolicy` applies cluster-wide regardless of which node the sandbox runs on.
+- Longhorn replication traffic between nodes is **not affected** — it goes through the host network (Cilium's host-level rules), not the sandbox's policy.

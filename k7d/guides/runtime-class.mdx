@@ -1,0 +1,102 @@
+---
+title: "RuntimeClass k7"
+description: "Run Kubernetes pods as k7d microVMs: daemon, shim, containerd config, RuntimeClass"
+---
+
+k7d plugs into Kubernetes as a containerd runtime: pods with `runtimeClassName: k7` run inside k7d microVMs instead of plain containers. Four steps register the runtime on a k3s node.
+
+<Note>
+The release [installer](/k7d/getting-started/installation) does all four steps for you: `sudo ./install.sh --with-k3s`. The manual steps below are for understanding what it does, or for non-k3s containerd setups.
+</Note>
+
+<Steps>
+<Step title="Install and start the daemon">
+
+The shim is a thin client: sandbox `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly if it is not running.
+
+```bash
+cp dist/k7d /usr/local/bin/
+cat > /etc/systemd/system/k7d.service <<'EOF'
+[Unit]
+Description=k7d VM runtime daemon
+
+[Service]
+ExecStart=/usr/local/bin/k7d
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl enable --now k7d
+```
+
+</Step>
+<Step title="Install the shim binary">
+
+```bash
+cp dist/containerd-shim-k7-v1 /usr/local/bin/
+```
+
+containerd resolves the binary from the runtime type automatically (`io.containerd.k7.v1` → `containerd-shim-k7-v1`).
+
+</Step>
+<Step title="Register the runtime in containerd">
+
+Add to `/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl`:
+
+```toml
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7]
+  runtime_type = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/*"]
+  privileged_without_host_devices = true
+  snapshotter = "overlayfs"
+```
+
+Two things matter here:
+
+- `pod_annotations` forwards the `k7d.katakate.org/*` pod annotations (`cluster-id`, `fork-vm-index`, …) into the sandbox OCI spec so the shim can see them — required for cluster-mode pods deployed via kubectl.
+- Do **not** add an `[options]` section with `BinaryName` — the option value leaks into the cgroup path and breaks shim startup.
+
+</Step>
+<Step title="Restart k3s and create the RuntimeClass">
+
+```bash
+systemctl restart k3s
+kubectl apply -f - <<'EOF'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: k7
+handler: k7
+EOF
+```
+
+Verify with `kubectl get runtimeclass k7` — it should show `HANDLER: k7`.
+
+</Step>
+</Steps>
+
+## Using it
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo
+spec:
+  runtimeClassName: k7
+  containers:
+    - name: main
+      image: alpine:3.20
+      command: ["sleep", "infinity"]
+```
+
+`kubectl logs`, `kubectl exec` (including `-it` with PTY, resize, Ctrl-C, detach), pod IPs, Services, DNS, ConfigMaps/Secrets, emptyDir/hostPath/PVC volumes, memory/CPU limits, init containers, natural exit / `restartPolicy`, and multi-vCPU guests all work — see the [feature matrix](/k7d/guides/feature-matrix) for the full support table and what's still to come (`hostNetwork`, NetworkPolicy, IPv6, cross-node fork).
+
+<Note>
+**CPU limits and vCPUs:** the shim derives the guest's vCPU count from the pod's CPU limit (`cpu: "2"` boots a 2-vCPU guest), and the limit is additionally enforced on the host via a CFS quota on the VM's vCPU threads. Fork and snapshot preserve multi-vCPU state.
+</Note>
+
+## Because VMs outlive shims
+
+The daemon owns the VMs, so a containerd restart or shim crash does not kill your workloads: a freshly respawned shim resolves its sandbox back to the still-running VM via the daemon's `reattach_sandbox` operation, which also verifies the guest agent still answers before handing the VM back.

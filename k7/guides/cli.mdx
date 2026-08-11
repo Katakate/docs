@@ -1,0 +1,341 @@
+---
+title: "CLI reference"
+description: "All k7 commands with options and examples"
+---
+
+Use `k7 -h` for built-in help. Below are the primary commands.
+
+## Talking to the K7 API
+
+By default, every sandbox-management command (`create`, `list`, `delete`,
+`pause`, `resume`, `fork`, `restore`, `exec`, `logs`, `snapshot *`) talks
+to the **K7 API** over HTTPS. The CLI resolves the URL and key in this
+order:
+
+1. `--api-url` / `--api-key` flags (per command).
+2. `K7_API_URL` / `K7_API_KEY` environment variables.
+3. `~/.config/k7/config.toml` — written by `k7 config set api.url ...` /
+   `k7 config set api.key ...`.
+4. On a cluster node only: `/etc/k7/api_endpoint` and the first entry of
+   `/etc/k7/api_keys.json`.
+
+```bash
+# One-time setup on your laptop.
+k7 config set api.url   https://10.0.0.1:31000
+k7 config set api.key   $(ssh root@node 'jq -r ".[0].token" /etc/k7/api_keys.json')
+
+# Then everything Just Works without SSH'ing to the node.
+k7 list
+k7 create demo alpine:3.20
+k7 fork demo demo-1
+k7 exec demo -- echo hello
+k7 logs demo --tail 50
+```
+
+### `--core` (debugging / on-node CI only)
+
+A hidden global flag `--core` skips the API and calls `K7Core` directly
+in-process. Useful when the API itself is misbehaving and you have
+kubeconfig access on the node. Most users should never need it.
+
+```bash
+k7 --core list                    # bypass API; talk to K3s directly
+k7 --core logs demo --follow      # required if you want live --follow today
+```
+
+## config
+
+```bash
+k7 config set KEY VALUE        # KEY ∈ {api.url, api.key}
+k7 config get KEY
+k7 config show                 # api.key is redacted
+```
+
+Writes `~/.config/k7/config.toml` with mode `0600`. Same posture as
+`~/.kube/config` and `~/.docker/config.json`. For production use, put
+the API behind ingress + TLS + IP allowlist; the plaintext key file is
+suitable for demos and trusted networks today.
+
+## install
+
+Install K7 components on host node(s).
+
+```bash
+k7 install [-v]
+```
+
+- **-v**: verbose output
+
+## version
+
+Check version of installed K7 .deb package
+
+```bash
+k7 -V
+```
+
+## create
+
+Create a sandbox from a YAML file or flags.
+
+```bash
+k7 create -f k7.yaml
+# or
+k7 create --name my-sb --image alpine:latest \
+  --cpu 1 --memory 1Gi --storage 2Gi \
+  --env-file .env --egress 10.0.0.5/32 \
+  --before-script "apk add curl"
+```
+
+## pause
+
+Scale a sandbox to 0 replicas, optionally taking a crash-consistent
+`VolumeSnapshot` of its root PVC. Snapshots are kata-qemu-longhorn-only and use the
+`longhorn` `VolumeSnapshotClass` registered by the install playbook.
+
+```bash
+k7 pause NAME                       # scale to 0, no snapshot
+k7 pause NAME --snapshot            # auto-named snapshot, then scale to 0
+k7 pause NAME --snapshot=demo-v1    # custom-named snapshot, then scale to 0
+k7 pause NAME -n my-ns --snapshot   # with namespace
+```
+
+- `--snapshot` (optional, takes optional value): when present, take a
+  `VolumeSnapshot` of the sandbox's root PVC (`<sandbox>-root-lh`) before
+  scaling down. Bare flag → snapshot named `<sandbox>-paused-<unix-ts>`;
+  with value → snapshot named as given.
+- Pause-time snapshots persist as `VolumeSnapshot` objects in the same
+  namespace until you delete them.
+
+## resume
+
+```bash
+k7 resume NAME [-n NAMESPACE]
+```
+
+Scales the deployment back to 1. State persisted on the root PVC survives.
+
+## restore
+
+Boot a brand-new sandbox from a standalone `VolumeSnapshot`. Unlike `k7 fork`,
+this does **not** require the original sandbox's Deployment to still exist —
+it only needs the snapshot.
+
+```bash
+k7 restore SNAPSHOT_NAME NEW_SANDBOX_NAME [-n NAMESPACE]
+  [--image IMAGE]                     # override (required if snapshot lacks k7.io/source-image)
+  [--root-disk-size 20Gi]
+  [--cpu 2] [--memory 4Gi] [--storage 10Gi]
+  [--sidecar docker]
+  [--cmd ...] [--entrypoint ...]      # repeatable
+  [--keep-snapshot/--no-keep-snapshot]
+```
+
+Image / backend / sidecar / limits / root-disk-size default to the source
+sandbox's values via the `k7.io/source-*` annotations stamped on the snapshot
+at creation time (pause / named only — fork-temp snapshots are auto-deleted).
+Any flag above overrides the corresponding annotation. `--no-keep-snapshot`
+deletes the source snapshot after the new sandbox is Ready. Restore is
+kata-qemu-longhorn-only.
+
+```bash
+# Happy path: snapshot has source annotations, no flags needed.
+k7 pause demo --snapshot=v1
+k7 delete demo
+k7 restore v1 demo-v1               # boots from snapshot, same image as before
+
+# Override the image (e.g. base-OS upgrade while keeping the persisted state).
+k7 restore v1 demo-v1 --image python:3.12-slim
+```
+
+## fork
+
+Clone an existing sandbox to a new sandbox. With the `kata-qemu-longhorn` backend, the root disk PVC (`<sandbox>-root-lh`) is cloned via a crash-consistent VolumeSnapshot.
+
+```bash
+k7 fork source-sandbox new-sandbox [--snapshot custom-name]
+```
+
+- `--snapshot` (optional): friendly name for the temporary VolumeSnapshot. If omitted, an auto-named `<source>-fork-<unix>` snapshot is created and **auto-deleted** once the new sandbox's PVC is bound.
+- Pass `--snapshot=NAME` to opt the snapshot out of GC (it becomes a `named` snapshot — persistent).
+- Storage scope: disk-only (no memory/CPU/network). One root PVC per sandbox; forks get their own cloned PVC.
+
+## snapshot
+
+Manage `VolumeSnapshot` objects directly. See [`/api/endpoints/snapshots`](/api/endpoints/snapshots) for the lifetime rules and the three kinds (`pause`, `fork`, `named`).
+
+```bash
+k7 snapshot list [-n NS] [-A]                           # list (per-namespace or cluster-wide)
+k7 snapshot list --sandbox demo                          # only snapshots tied to a sandbox
+k7 snapshot list --kind pause                            # filter by kind: pause / fork / named
+k7 snapshot inspect NAME [-n NS]                         # full JSON dump
+k7 snapshot create SANDBOX SNAP_NAME [-n NS]             # named snapshot of a running sandbox
+k7 snapshot delete NAME [-n NS] [--yes]                  # delete one snapshot (refuses non-TTY without --yes)
+k7 snapshot gc [-n NS] [-A] [--keep-fork-for 10m] [--dry-run]
+```
+
+`gc` only ever touches `kind=fork` snapshots older than `--keep-fork-for`. Pause and named snapshots are never collected, even with `--keep-fork-for=0s`. A CronJob (`k7-snapshot-gc` in `kube-system`) runs the same logic every 10 minutes as a backstop, in case the inline cleanup after `k7 fork` ever misses a snapshot.
+
+### YAML configuration reference
+
+All fields map to the server-side `SandboxConfig`:
+
+- **name** (string, required): unique sandbox name.
+- **image** (string, required): container image, e.g. `alpine:latest`.
+- **namespace** (string, default `default`): Kubernetes namespace.
+- **env_file** (string, optional): (absolute) path to an env file on the host node.
+- **egress_whitelist** (array of CIDR strings, optional): allowed egress IPs, e.g. `"1.1.1.1/32"` for single hosts or `"10.0.0.0/8"` for ranges.
+- **limits** (object, optional): resource limits:
+  - **cpu** (string): cores or millicores, e.g. `"1"` or `"500m"`.
+  - **memory** (string): e.g. `"1Gi"`, `"512Mi"`.
+  - **ephemeral-storage** (string): e.g. `"2Gi"`.
+- **before_script** (string, optional): shell script run once after container starts.
+  - Runs via `kubectl exec` before egress netpol is applied; readiness waits for completion.
+- **pod_non_root** (boolean, optional): run Pod as non-root (UID/GID/FSGroup 65532).
+- **container_non_root** (boolean, optional): run container as non-root (UID 65532), no privilege escalation.
+- **cap_add** (string[], optional): add back Linux capabilities (default policy drops ALL).
+- **cap_drop** (string[], optional): override drop policy. If omitted, `ALL` is dropped by default.
+
+Example `k7.yaml`:
+
+```yaml
+name: project-build
+image: alpine:latest
+namespace: default
+egress_whitelist:
+  - "10.0.0.5/32"      # Private egress proxy/gateway
+limits:
+  cpu: "1"
+  memory: "1Gi"
+  ephemeral-storage: "2Gi"
+before_script: |
+  # Non-root friendly example: create a working dir and print versions
+  mkdir -p "$HOME/work" && cd "$HOME/work"
+  echo "PATH=$PATH"
+  echo "whoami: $(whoami)"
+pod_non_root: false
+container_non_root: false
+cap_add:
+  - CHOWN
+```
+
+<Warning>
+Do not whitelist public DNS resolvers (e.g., 1.1.1.1, 8.8.8.8). Doing so re-enables DNS exfiltration (UDP/TCP 53 and DoH over 443). Prefer whitelisting only your own egress proxy IP and enforce DNS/DoH policies at the proxy.
+
+If using package managers that require root (e.g., `apk add`, `apt-get install`) in `before_script` make sure you didn't add security policies that prevent it such as running the pod or container as non-root. Check Security & Networking section in the API reference for more.
+</Warning>
+
+
+## list
+
+```bash
+k7 list [-n NAMESPACE]
+```
+Lists sandboxes with status, readiness, restarts, age, and image.
+
+## delete
+
+```bash
+k7 delete NAME [-n NAMESPACE]
+```
+Deletes one sandbox.
+
+## delete-all
+
+```bash
+k7 delete-all [-n NAMESPACE]
+```
+Deletes all sandboxes in a namespace (with confirmation).
+
+## shell
+
+```bash
+k7 shell NAME [-n NAMESPACE]
+```
+Opens an interactive shell in the sandbox pod.
+
+## logs
+
+```bash
+k7 logs NAME [-n NAMESPACE] [--tail 200] [-f]
+```
+Shows container logs (before script and main container).
+
+## top
+
+```bash
+k7 top [-n NAMESPACE] [--refresh-interval 1]
+```
+Top-like view of CPU and memory usage.
+
+## api
+
+The K7 API is deployed automatically by `k7 install` and runs as a Kubernetes
+Deployment (`k7-api` in `kube-system`). K3s keeps it running and reschedules
+it on failure — there is no separate "start" step. The `k7 api` sub-app
+provides read-only diagnostics and a feature toggle:
+
+```bash
+k7 api status        # readiness, endpoint, key-management hints
+k7 api endpoint      # just the URL (machine-readable, single line)
+k7 api enable        # scale the existing Deployment to 1 (turn back on)
+k7 api disable       # scale to 0 (temporary off)
+```
+
+To install without the API (CLI-only deployment, e.g. for local-only
+test rigs), pass `--no-api` to `k7 install`. Re-run `k7 install` later
+(without `--no-api`) to add it; the playbook is idempotent.
+
+```bash
+k7 install --no-api                    # provision cluster without the API
+k7 install                             # re-run later to add it
+```
+
+The previous top-level commands `k7 start-api` / `k7 stop-api` /
+`k7 api-status` / `k7 get-api-endpoint` are deprecated; they still work
+for one release and print a one-line warning pointing at the new home.
+
+## API keys
+
+```bash
+k7 generate-api-key NAME [--expires-days 365]
+k7 list-api-keys
+k7 revoke-api-key NAME
+```
+
+Keys are stored at `/etc/k7/api_keys.json`. Use with `X-API-Key` or `Authorization: Bearer`.
+
+### Flag reference (create)
+
+- **-n, --namespace**: Kubernetes namespace (default `default`).
+- **-f, --file**: YAML config file (defaults to `k7.yaml` when using `k7 create`).
+- **--name**: Sandbox name (when not using YAML).
+- **--image**: Container image (when not using YAML).
+- **--cpu**: CPU limit (e.g., `1`, `500m`).
+- **--memory**: Memory limit (e.g., `1Gi`, `512Mi`).
+- **--storage**: Ephemeral storage limit (e.g., `2Gi`).
+- **--env-file**: Path to env file on the host node injected as a Secret.
+- **--egress CIDR**: Repeatable; whitelist CIDR blocks for egress (omit to keep open; use none for full block).
+- **--before-script**: Shell script to run once after container start; runs with open egress before lockdown.
+- **--entrypoint**: Repeatable; override image ENTRYPOINT (ordered).
+- **--cmd**: Repeatable; override image CMD (ordered).
+- **--pod-non-root / --no-pod-non-root**: Pod-level non-root defaults.
+- **--container-non-root / --no-container-non-root**: Container runs as UID 65532, no privilege escalation.
+- **--cap-add CAP**: Repeatable; add back Linux capabilities (default drop ALL).
+- **--cap-drop CAP**: Repeatable; override default drop policy.
+
+<Info>
+Package installs like `apk add` require root inside the container. Either leave `container_non_root` disabled for setup or prebuild an image. See Security & networking: `/api/security`.
+</Info>
+
+<Info>
+For `kata-qemu-longhorn`, the persistence wrapper requires `/bin/sh`, `tar`, and `mount` in the image. Use a Debian/Ubuntu-like base (or ensure those tools are installed).
+</Info>
+<Info>
+For `kata-qemu-longhorn`, the main container runs privileged to allow bind mounts for persistence.
+</Info>
+<Info>
+For `kata-qemu-longhorn`, the wrapper preserves the image ENTRYPOINT+CMD by default. Use `--entrypoint` and/or `--cmd` to override.
+</Info>
+
+

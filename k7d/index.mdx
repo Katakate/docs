@@ -1,0 +1,32 @@
+---
+title: "K7d"
+sidebarTitle: "Introduction"
+description: "Fork a running Kubernetes cluster in ~100 ms. Run 50 copies on one 64 GB box."
+---
+
+<Frame>
+<img src="/k7d/k7d-cover.png" alt="k7d: fork isolated Kubernetes clusters in ~100 ms" />
+</Frame>
+
+k7d is a Rust VMM that forks running VMs — including a live multi-VM Kubernetes cluster — in ~100 ms, with memory, disk, processes, and network identity intact. Boot once, then explore dozens of byte-identical worlds for RL and agent evals. For sandboxes at scale with a CLI / API / Python SDK, see [K7](/k7/index).
+
+<CardGroup cols={2}>
+<Card title="CoW fork" icon="bolt" href="/k7d/concepts/cow-fork">
+How a 5 ms VM fork works: shared memory until write, dirty pages, byte-identical copies.
+</Card>
+<Card title="GRPO / tree search" icon="sitemap" href="/k7d/guides/grpo">
+Wire k7d into a trainer: fork_batch, protect, prune, auto_evict under RAM budgets.
+</Card>
+<Card title="Cluster mode" icon="network-wired" href="/k7d/guides/cluster-mode">
+Create or adopt an N-node k3s cluster and fork it without agent restarts.
+</Card>
+<Card title="Daemon API" icon="code" href="/k7d/api/protocol">
+JSON-lines protocol on /run/k7d/k7d.sock — every tree and VM verb.
+</Card>
+<Card title="Benchmarks" icon="gauge-high" href="/k7d/deep-dives/benchmarks">
+Hardware, exact commands, and every enforced latency budget.
+</Card>
+<Card title="Formal verification" icon="shield-halved" href="/k7d/deep-dives/formal-verification">
+Kani on unsafe paths; Aeneas→Lean on the tree budget model.
+</Card>
+</CardGroup>

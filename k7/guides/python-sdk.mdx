@@ -1,0 +1,257 @@
+---
+title: "Python SDK"
+description: "Use the k7-sdk package to manage sandboxes from Python"
+---
+
+The **`k7-sdk`** PyPI package (`import k7_sdk`) wraps the K7 HTTP API in two clients. The legacy **`katakate`** name still installs but emits a deprecation warning.
+
+- `Client` — synchronous, backed by `requests`.
+- `AsyncClient` — `asyncio`-native, backed by `httpx`.
+
+## Install
+
+```bash
+pip install k7-sdk            # sync client (requests only)
+pip install "k7-sdk[async]"   # also installs httpx for AsyncClient
+```
+
+The async client raises `RuntimeError` at construction time if `httpx` isn't installed.
+
+## Quickstart
+
+```python
+from k7_sdk import Client
+
+k7 = Client(endpoint="http://node:31007", api_key="<your-key>")
+
+sb = k7.create({
+    "name": "demo",
+    "image": "alpine:latest",
+    "before_script": "apk add --no-cache curl",
+})
+
+print(sb.exec("uname -a"))
+print(k7.list())
+sb.delete()
+```
+
+Discover the endpoint with `k7 api endpoint` and the key with `k7 generate-api-key <name>`. See the [CLI guide](/k7/guides/cli) for full details.
+
+## `Client` reference
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `Client(endpoint, api_key, verify_ssl=True)` | — | TLS verify is on by default. Set `verify_ssl=False` only for self-signed dev clusters. |
+| `create(config: dict)` | `SandboxProxy` | `config` matches [`SandboxConfig`](/k7/api/endpoints/sandboxes#request-body-schema). |
+| `list(namespace=None)` | `list[dict]` | Omit `namespace` to list all. |
+| `delete(name, namespace="default")` | `dict` | |
+| `delete_all(namespace="default")` | `dict` | Returns `{message, results: [{name, success, error}]}`. |
+| `get_metrics(namespace=None)` | `list[dict]` | Per-sandbox `cpu_usage` / `memory_usage`. |
+| `install(playbook=None, inventory=None, verbose=False)` | `dict` | Trigger an Ansible run via the API. Useful for joining new nodes. |
+| `pause(name, snapshot=None, namespace=...)` | `dict` | Scale to 0; optional VolumeSnapshot name |
+| `resume(name, namespace=...)` | `dict` | Scale back to 1 |
+| `fork(source, new_name, namespace=..., snapshot=None)` | `SandboxProxy` | Clone root disk (kata-qemu-longhorn) |
+| `restore(snapshot, new_name, overrides=None, keep_snapshot=True)` | `SandboxProxy` | New sandbox from a snapshot |
+| `list_snapshots(...)` / `delete_snapshot(...)` / `gc_snapshots(...)` | varies | Snapshot lifecycle (see [Snapshots API](/k7/api/endpoints/snapshots)) |
+
+`SandboxProxy` (returned by `create`) exposes:
+
+- `exec(command: str) -> dict` — `{exit_code, stdout, stderr, duration_ms}`
+- `delete() -> dict` — shorthand for `client.delete(name, namespace)`
+- `pause` / `resume` / `fork` — same as the client methods, scoped to this sandbox
+- `snapshot(name)` — named VolumeSnapshot without pausing
+
+The proxy keeps a reference to the `Client`, so calling `sb.exec(...)` after the parent client closes will raise.
+
+## All sandbox config fields
+
+The `create()` payload accepts every field from the API schema. Common ones:
+
+```python
+sb = k7.create({
+    "name": "secure-sb",
+    "image": "alpine:latest",
+    "namespace": "default",
+
+    # Backend selection
+    "backend": "kata-qemu-longhorn",      # or "kata-firecracker-devmapper"
+    "root_disk_size": "20Gi",        # kata-qemu-longhorn only
+
+    # Sidecar (Docker-in-VM)
+    "sidecar": "docker",
+
+    # Non-root + minimal capabilities
+    "pod_non_root": True,
+    "container_non_root": True,
+    "cap_add": ["CHOWN"],
+
+    # FQDN-aware egress (Cilium); falls back to CIDR if all entries are CIDRs
+    "egress_whitelist": ["api.openai.com", "*.huggingface.co"],
+
+    # Resource budget
+    "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
+
+    # Setup commands run with open egress before lockdown
+    "before_script": "pip install openai",
+
+    # Override entrypoint/cmd
+    "entrypoint": ["/usr/bin/python3"],
+    "cmd": ["-c", "import time; time.sleep(3600)"],
+})
+```
+
+See [Sandboxes API](/k7/api/endpoints/sandboxes#request-body-schema) for the full table.
+
+<Info>
+`env_file` points to a path **on the API node**, not the client. To inject runtime env vars from the client, build them into your `before_script` (`echo "KEY=value" > /etc/sandbox.env`) or commit them to your sandbox image.
+</Info>
+
+## Wait until ready
+
+The API returns immediately after creating Kubernetes objects; the pod schedules and boots in the background. A small polling helper:
+
+```python
+import time
+
+def wait_until_ready(client, name, namespace="default", timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for s in client.list(namespace=namespace):
+            if s["name"] == name and s["status"] == "Running" and s["ready"] == "True":
+                return
+        time.sleep(2)
+    raise TimeoutError(f"{name} did not become Ready")
+
+wait_until_ready(k7, "secure-sb")
+```
+
+## Pause, resume, fork
+
+`pause`, `resume`, and `fork` work on `Client` and on the `SandboxProxy` from `create`. Fork clones the root disk via Longhorn `VolumeSnapshot` and requires the **kata-qemu-longhorn** backend.
+
+```python
+base = k7.create({
+    "name": "demo",
+    "image": "python:3.12-slim",
+    "backend": "kata-qemu-longhorn",
+    "before_script": "pip install numpy pandas",
+})
+wait_until_ready(k7, "demo")
+
+base.pause(snapshot="demo-v1")
+base.resume()
+
+forks = [base.fork(f"exp-{i}") for i in range(8)]
+for f in forks:
+    print(f.exec("python -c 'import numpy; print(numpy.__version__)'")["stdout"])
+    f.delete()
+```
+
+See [Snapshots & fork](/k7/guides/snapshots-fork) for timing notes and CLI equivalents.
+
+## Snapshots and restore
+
+```python
+base.snapshot("demo-experiment-1")
+
+for s in k7.list_snapshots(sandbox="demo"):
+    print(s["name"], s["kind"], s["age"])
+
+k7.delete_snapshot("demo-experiment-1")
+k7.gc_snapshots(all_namespaces=True, keep_fork_for="10m", dry_run=True)
+
+base.pause(snapshot="demo-v1")
+base.delete()
+
+restored = k7.restore("demo-v1", "demo-restored")
+print(restored.exec("ls /")["stdout"])
+```
+
+Full HTTP detail: [Snapshots API](/k7/api/endpoints/snapshots).
+
+## Async client
+
+```python
+import asyncio
+from k7_sdk import AsyncClient
+
+async def main():
+    k7 = AsyncClient(endpoint="http://node:31007", api_key="<your-key>")
+    try:
+        await k7.create({"name": "async-sb", "image": "alpine:latest"})
+
+        for _ in range(60):
+            sbs = await k7.list()
+            if any(s["name"] == "async-sb" and s["ready"] == "True" for s in sbs):
+                break
+            await asyncio.sleep(2)
+
+        out = await k7.exec("async-sb", "echo from async")
+        print(out["stdout"])
+    finally:
+        await k7.delete("async-sb")
+        await k7.aclose()
+
+asyncio.run(main())
+```
+
+`AsyncClient` mirrors the sync client surface (`create`, `list`, `delete`, `delete_all`, `exec`, `get_metrics`, `aclose`). Note that `AsyncClient.exec` is a top-level method (`await k7.exec(name, command)`) rather than a proxy method.
+
+### Concurrent sandbox fan-out
+
+```python
+import asyncio
+from k7_sdk import AsyncClient
+
+async def run_one(k7, idx):
+    name = f"worker-{idx}"
+    await k7.create({"name": name, "image": "python:3.12-slim"})
+    try:
+        for _ in range(60):
+            if any(
+                s["name"] == name and s["ready"] == "True"
+                for s in await k7.list()
+            ):
+                break
+            await asyncio.sleep(2)
+        result = await k7.exec(name, f"python -c 'print({idx} ** 2)'")
+        return result["stdout"].strip()
+    finally:
+        await k7.delete(name)
+
+async def main():
+    k7 = AsyncClient(endpoint="http://node:31007", api_key="<your-key>")
+    try:
+        results = await asyncio.gather(*[run_one(k7, i) for i in range(10)])
+        print(results)
+    finally:
+        await k7.aclose()
+
+asyncio.run(main())
+```
+
+## Errors
+
+`requests.HTTPError` / `httpx.HTTPStatusError` are raised on non-2xx responses. The error body follows the API envelope:
+
+```json
+{ "error": { "code": "BadRequest", "message": "name already exists" } }
+```
+
+Recover the structured error:
+
+```python
+import requests
+
+try:
+    sb = k7.create({"name": "demo", "image": "alpine"})
+except requests.HTTPError as e:
+    body = e.response.json()
+    print(body["error"]["code"], body["error"]["message"])
+```
+
+## Tips
+
+- Always pass `namespace=` if you use anything other than `default`.
+- Rotate API keys with `k7 revoke-api-key <name>` and `k7 generate-api-key <name>`.
+- The same operations are available via CLI (`k7 pause`, `k7 fork`, `k7 snapshot`, `k7 restore`) — default CLI path is the HTTP API; use `--core` only on the cluster node.

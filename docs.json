@@ -1,0 +1,153 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "linden",
+  "name": "Katakate",
+  "colors": {
+    "primary": "#ef672b",
+    "light": "#ef672b",
+    "dark": "#ef672b"
+  },
+  "appearance": {
+    "default": "dark",
+    "background": {
+      "color": { "dark": "#000000" }
+    }
+  },
+  "favicon": "/k7d/favicon.png",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Home",
+        "groups": [
+          {
+            "group": "Katakate",
+            "pages": ["index"]
+          }
+        ]
+      },
+      {
+        "tab": "K7",
+        "icon": "/k7/favicon.png",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": ["k7/index", "k7/getting-started/installation"]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "k7/concepts/architecture",
+              "k7/concepts/backends",
+              "k7/concepts/networking",
+              "k7/concepts/security-model"
+            ]
+          },
+          {
+            "group": "Using Katakate",
+            "pages": [
+              "k7/guides/cli",
+              "k7/guides/python-sdk",
+              "k7/guides/multi-node",
+              "k7/guides/snapshots-fork",
+              "k7/guides/sidecars",
+              "k7/guides/langchain-agent",
+              "k7/guides/utilities"
+            ]
+          },
+          {
+            "group": "API overview",
+            "pages": ["k7/api/introduction", "k7/api/security"]
+          },
+          {
+            "group": "API endpoints",
+            "pages": [
+              "k7/api/endpoints/sandboxes",
+              "k7/api/endpoints/snapshots",
+              "k7/api/endpoints/exec",
+              "k7/api/endpoints/metrics",
+              "k7/api/endpoints/health"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "K7d",
+        "icon": "/k7d/favicon.png",
+        "groups": [
+          {
+            "group": "Getting started",
+            "pages": ["k7d/index", "k7d/getting-started/installation"]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "k7d/concepts/cow-fork",
+              "k7d/concepts/network-identity",
+              "k7d/concepts/snapshot-tree",
+              "k7d/concepts/architecture",
+              "k7d/concepts/security"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "k7d/guides/grpo",
+              "k7d/guides/cluster-mode",
+              "k7d/guides/runtime-class",
+              "k7d/guides/feature-matrix"
+            ]
+          },
+          {
+            "group": "API",
+            "pages": ["k7d/api/protocol"]
+          },
+          {
+            "group": "Deep dives",
+            "pages": [
+              "k7d/deep-dives/benchmarks",
+              "k7d/deep-dives/formal-verification"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Blog",
+        "groups": [
+          {
+            "group": "Posts",
+            "pages": ["blog/docker-in-vm-fork"]
+          }
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/k7/images/k7-logo.png",
+    "dark": "/k7/images/k7-logo.png"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/Katakate"
+      }
+    ]
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Katakate"
+    }
+  }
+}

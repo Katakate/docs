@@ -1,0 +1,37 @@
+---
+title: "Security model"
+description: "What k7d isolates, what it deliberately doesn't, and current limitations"
+---
+
+k7d makes a deliberate trade-off: it optimizes for **fleets of your own environments** (RL rollouts, agent tree search, CI sandboxes), not for hostile multi-tenant isolation between forks. Read this page before deciding where to run it.
+
+## The trade-off: one daemon, many VMs, one address space
+
+Live copy-on-write fork requires parent and child memory to be mappings **in the same process** — that is what makes a ~5 ms fork possible. So the k7d daemon hosts all VMs in one address space.
+
+What this means:
+
+- **Guest → host isolation is still KVM.** Every guest runs behind hardware virtualization, the same boundary Firecracker and Kata rely on.
+- **Isolation *between sibling forks of the same tenant* is weaker** than Firecracker's one-jailed-process-per-VM model: a hypothetical daemon-level memory-safety bug could expose one fork's memory to code exploiting another. Forks cannot reach each other over the network (separate bridges — see [Network identity](/k7d/concepts/network-identity)), but they share a host process.
+
+If your threat model is "mutually hostile customers on shared hardware", put tenants on separate k7d hosts (or use K7's [kata-firecracker-devmapper backend](/k7/concepts/backends)). If it is "thousands of copies of my own environment", this design buys you the fork.
+
+## What survives a fork
+
+Everything inside the forked set: in-cluster TLS sessions, established TCP between member VMs, disk state, process state. Guest clocks are reset so time does not jump backwards.
+
+What doesn't: TCP to the outside world (the far end never forked). Forks keep their in-cluster addresses; only the host-facing identity is new.
+
+## Hardening that exists today
+
+- **≤25k lines of Rust for the VMM + shim** — a small, auditable surface, deliberately not a kitchen-sink VMM.
+- **Memory safety by construction**: Rust, with `unsafe` blocks contained, annotated with safety comments, and enforced by lint (`deny(unsafe_op_in_unsafe_fn)`).
+- **Formal methods on selected paths**: Kani bounded model checking over `unsafe` / address-arithmetic harnesses; Aeneas→Lean proofs of the tree budget/eviction model. Not a claim that everything is proven — see [Formal verification](/k7d/deep-dives/formal-verification).
+- **Loud failures**: no silent fallbacks; every error is surfaced. Fuzzing runs over the agent protocol and virtio-blk request parsing.
+- **Guest agent is minimal**: a static binary speaking JSON-lines over vsock; `runc` runs inside the guest, never on the host.
+
+## Current limitations
+
+- **Single host, x86_64 Linux + KVM only.** Cross-node fork is on the roadmap. Does not build on macOS/Windows.
+- **The daemon runs as root** (KVM, TAP, bridge, and iptables setup require it).
+- **Young project.** One primary test machine, no external security audit yet. Small surface by design, but treat it accordingly.

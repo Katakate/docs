@@ -1,0 +1,116 @@
+---
+title: "Installation"
+description: "Install k7d from a release tarball or build from source, then fork your first cluster"
+---
+
+## Requirements
+
+- **Linux amd64 / x86_64 host with KVM** — same ISA (`amd64` is the Debian
+  name; release tarballs use `x86_64`). `/dev/kvm` must exist. Bare metal or
+  a cloud instance with nested virtualization both work. k7d does not build
+  or run on macOS / Windows / ARM.
+- **root** — the daemon manages TAP devices, bridges, and `/run/k7d/`.
+- Optional: **k3s**, if you want pods scheduled as k7d microVMs via
+  [`runtimeClassName: k7`](/k7d/guides/runtime-class).
+
+```bash
+ls /dev/kvm   # must exist before anything else
+```
+
+## Install from a release tarball
+
+Each release ships a self-contained tarball with the daemon, the
+containerd shim, the guest kernel, the guest initramfs, and an installer.
+
+```bash
+tar xzf k7d-v0.1.0-x86_64-linux.tar.gz
+cd k7d-v0.1.0-x86_64-linux
+sudo ./install.sh
+```
+
+The installer:
+
+- copies `k7d` and `containerd-shim-k7-v1` to `/usr/local/bin`
+  (override with `--prefix DIR`),
+- copies the guest kernel (`vmlinux`) and initramfs to
+  `/usr/local/share/k7d`,
+- writes a `k7d.service` systemd unit that points `K7D_KERNEL` /
+  `K7D_INITRD` at those assets, sets `RUST_LOG=info`, and raises
+  `LimitNOFILE` to 524288 (the 1024 soft default is far too low for
+  multi-cluster forks),
+- starts the daemon and waits for the control socket.
+
+Verify:
+
+```bash
+systemctl status k7d
+ls /run/k7d/k7d.sock
+```
+
+### Registering with k3s
+
+If the host runs k3s and you want `runtimeClassName: k7`, add
+`--with-k3s`:
+
+```bash
+sudo ./install.sh --with-k3s
+```
+
+This registers the `k7` runtime in the k3s containerd config template,
+restarts k3s, and applies the RuntimeClass. The
+[RuntimeClass guide](/k7d/guides/runtime-class) explains each step if you
+prefer to do it by hand — or need to know why the config must not set
+`BinaryName`.
+
+## Build from source
+
+You need Rust and Docker (the guest rootfs is built in a container).
+
+```bash
+git clone https://github.com/Katakate/k7d && cd k7d
+make release    # daemon, shim, guest kernel, rootfs → dist/
+```
+
+`make release` produces the same tarball layout under `dist/` — run
+`sudo ./install.sh` from there, or start the daemon directly for a quick
+look:
+
+```bash
+sudo RUST_LOG=info ./dist/k7d &
+```
+
+## Fork your first cluster
+
+The repository ships a demo that boots a live 3-VM k3s cluster once, then
+forks it into parallel branches, scores them, keeps the winner, and
+prunes the rest — printing the fork wall-clock as it goes.
+
+```bash
+cd examples/cluster-tree-search
+python3 run_demo.py --mode busybox --branches 4
+
+# the density claim — 50 cluster forks on one 64 GB box:
+python3 run_demo.py --mode busybox --branches 50
+```
+
+Everything the demo does goes through the JSON-lines protocol on
+`/run/k7d/k7d.sock` — the same verbs your own trainer would call. See the
+[daemon API](/k7d/api/protocol) for the full verb list and the
+[GRPO guide](/k7d/guides/grpo) for wiring it into a training loop.
+
+## Next steps
+
+<CardGroup cols={2}>
+<Card title="Cluster mode" icon="network-wired" href="/k7d/guides/cluster-mode">
+Create or adopt an N-node k3s cluster and fork it without agent restarts.
+</Card>
+<Card title="GRPO / tree search" icon="sitemap" href="/k7d/guides/grpo">
+fork_batch, protect, prune, auto_evict under RAM budgets.
+</Card>
+<Card title="RuntimeClass k7" icon="dharmachakra" href="/k7d/guides/runtime-class">
+Schedule Kubernetes pods as k7d microVMs.
+</Card>
+<Card title="How CoW fork works" icon="bolt" href="/k7d/concepts/cow-fork">
+Why a fork costs ~5 ms and dirty pages, not full guest RAM.
+</Card>
+</CardGroup>

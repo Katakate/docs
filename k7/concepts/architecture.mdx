@@ -1,0 +1,139 @@
+---
+title: "Architecture"
+description: "How the CLI, API, K3s, Kata, and the VM backends fit together"
+---
+
+Katakate is a thin orchestration layer over a curated stack of battle-tested infrastructure. This page explains what the moving parts are and how they talk to each other.
+
+## High-level diagram
+
+```mermaid
+flowchart TB
+    subgraph Client["Client (your machine)"]
+        direction LR
+        CLI["k7 CLI"]
+        SDK["Python SDK<br/>k7-sdk"]
+        Curl["curl / your<br/>HTTP client"]
+    end
+
+    subgraph Node["K7 node — Ubuntu + K3s"]
+        direction TB
+
+        subgraph ControlPlane["K3s control plane"]
+            API["k7-api<br/>FastAPI Deployment<br/>kube-system · NodePort 31007"]
+            K3sAPI["K3s API server"]
+            Sched["scheduler<br/>(nodeSelector by backend)"]
+            API -- "kubernetes_asyncio" --> K3sAPI
+            K3sAPI --- Sched
+        end
+
+        subgraph DataPlane["Data plane<br/>per node"]
+            direction LR
+            Cilium["Cilium CNI<br/>NetworkPolicy +<br/>CiliumNetworkPolicy"]
+            Containerd["K3s containerd<br/>+ Kata shim<br/>(kata-fc / kata-qemu)"]
+        end
+
+        subgraph Sandbox["Sandbox VM (Kata)"]
+            VMM["Firecracker (+ jailer)<br/>or QEMU"]
+            UserCnt["user container"]
+            VMM --- UserCnt
+        end
+
+        Storage[("Storage backends<br/>LVM thin-pool · Longhorn PVC")]
+
+        K3sAPI -- "schedules pod" --> Containerd
+        Cilium -. "wires netns" .- Containerd
+        Containerd -- "launches" --> VMM
+        VMM -. "rootfs" .- Storage
+    end
+
+    CLI -- "local: K7Core direct<br/>remote: HTTPS + X-API-Key" --> API
+    SDK -- "HTTPS · X-API-Key" --> API
+    Curl -- "HTTPS · X-API-Key" --> API
+
+    classDef client fill:#0f1a2a,stroke:#3b82f6,color:#fff;
+    classDef ctrl fill:#1a1a1a,stroke:#888,color:#fff;
+    classDef data fill:#0b0b0b,stroke:#ef672b,color:#fff;
+    classDef vm fill:#2a1a05,stroke:#ef672b,color:#fff;
+    classDef store fill:#0b1a0b,stroke:#22c55e,color:#fff;
+    class Client,CLI,SDK,Curl client;
+    class ControlPlane,API,K3sAPI,Sched ctrl;
+    class DataPlane,Cilium,Containerd data;
+    class Sandbox,VMM,UserCnt vm;
+    class Storage store;
+```
+
+## Components
+
+### CLI — `k7`
+
+A Typer-based CLI distributed as a Debian package (`apt install k7`). It wraps `K7Core` directly for node-local operations (`install`, `create`, `shell`, `top`) and shells out to `kubectl` only where unavoidable (e.g. interactive `kubectl exec` for `k7 shell`).
+
+### API — `k7-api`
+
+A FastAPI service that exposes a REST surface for sandbox lifecycle and exec. The API runs as a **K3s `Deployment`** in `kube-system` with a `NodePort` Service, an in-cluster `ServiceAccount`, and a scoped `ClusterRole`. Stop it with `k7 stop-api` (scale to 0) or `k7 stop-api --delete` (full teardown).
+
+The entire `K7Core` is async (`kubernetes_asyncio` + `httpx`), so the API can serve concurrent requests without thread-pool workarounds.
+
+### Python SDK — `k7-sdk`
+
+A small `requests`/`httpx` wrapper published to PyPI as **`k7-sdk`** (`from k7_sdk import Client`). Both `Client` (sync) and `AsyncClient` (async, `pip install "k7-sdk[async]"`) speak the same JSON envelope as the API.
+
+### K3s
+
+The CNCF-certified Kubernetes distribution we install on every node. K3s is single-binary, supports embedded etcd for HA, and ships its own containerd. Katakate **does not touch your existing Docker or containerd** — K3s installs its own runtime so installation is non-disruptive.
+
+### Cilium
+
+Cilium is the default CNI plugin. It enables **FQDN-based egress** (e.g. allow `api.openai.com` instead of a CIDR) via `CiliumNetworkPolicy`. Cilium runs with `kubeProxyReplacement=true` for a leaner stack. Pass `--cni flannel` at install time to fall back to K3s' default CNI (CIDR-only egress).
+
+### Kata Containers
+
+Kata is the OCI runtime that turns each pod into a lightweight VM. We install both runtime classes:
+
+- `kata-fc` — Firecracker microVMs (used by `kata-firecracker-devmapper`)
+- `kata-qemu` — QEMU-based VMs (used by `kata-qemu-longhorn`)
+
+### Backends
+
+A **backend** is a tuple of (runtime class, storage driver). There are three:
+
+| Backend | Alias | Runtime | Storage | Best for |
+|---------|-------|---------|---------|----------|
+| `kata-firecracker-devmapper` | `kfd` | Kata + Firecracker + jailer | LVM thin-pool snapshotter | Lightest footprint, fastest cold boot, ephemeral workloads |
+| `kata-qemu-longhorn` | `kql` | Kata + QEMU | Longhorn CSI (replicated PVCs) | Persistent volumes, disk-level snapshot/pause/resume/fork |
+| `k7d` | — | [k7d Rust VMM](/k7d/index) (`runtimeClassName: k7`) | erofs on virtio-blk + host-local state | ~5 ms warm fork, snapshot trees, RL / agent tree search |
+
+A node can support **one or more** backends; on a multi-node cluster, different nodes can specialize. See [Backends](/k7/concepts/backends) for a deeper comparison.
+
+### Storage — Longhorn (kata-qemu-longhorn only)
+
+[Longhorn](https://longhorn.io/) provides cluster-wide replicated block storage via a Kubernetes CSI driver. Each `kata-qemu-longhorn` sandbox gets its own root PVC (`<sandbox>-root-lh`), backed by `numberOfReplicas` replicas spread across nodes. The default StorageClass uses `WaitForFirstConsumer` binding and `dataLocality: best-effort` so the volume is created on (and one replica stays on) the node where the pod is scheduled. VolumeSnapshots power `pause`/`resume`/`fork`.
+
+### Storage — devmapper thin-pool (kata-firecracker-devmapper only)
+
+A raw disk is provisioned as an LVM thin-pool. Containerd's devmapper snapshotter creates per-sandbox logical volumes from this pool, giving each microVM its own block device while sharing the underlying physical storage efficiently.
+
+## Request lifecycle: `k7 create`
+
+1. **Client → API**: `POST /api/v1/sandboxes` with a `SandboxConfig` JSON body. The API validates the API key (SHA-256 hashed, timing-safe compare) and forwards to `K7Core.create_sandbox`.
+2. **K7Core**: builds a Kubernetes `Deployment` (1 replica), an optional `Secret` from `env_file`, an optional `PVC` (`<name>-root-lh`) on `kata-qemu-longhorn`, an ingress-deny `NetworkPolicy`, and either a CIDR `NetworkPolicy` or a `CiliumNetworkPolicy` for egress.
+3. **K3s scheduler** picks a node based on `nodeSelector` (`k7.katakate.org/backend-<backend>=true`, set by the installer per host).
+4. **Kata** (via the appropriate containerd shim) launches a VM, mounts the rootfs (devmapper or Longhorn PVC), and starts the user container inside it.
+5. **`before_script`** runs via `kubectl exec` while egress is still open. Once it completes, the egress NetworkPolicy is applied and the pod is marked Ready.
+6. The API returns `201 Created` with a `Location` header.
+
+## Source code map
+
+```
+src/
+├── k7/
+│   ├── api/        FastAPI service (Dockerfile + manifests deploy as a K3s Deployment)
+│   ├── cli/        Typer CLI, packaged as the k7 .deb
+│   ├── core/       K7Core: async sandbox lifecycle (Kubernetes + Longhorn + Cilium)
+│   │   ├── core.py      ~2k LoC of orchestration
+│   │   ├── models.py    SandboxConfig / SandboxInfo / ExecResult dataclasses
+│   │   └── sidecar.py   SidecarSpec + SIDECAR_REGISTRY (Docker-in-VM, etc.)
+│   └── deploy/     Ansible playbook + manifests
+└── k7_sdk/         Python SDK (PyPI package k7-sdk)
+```

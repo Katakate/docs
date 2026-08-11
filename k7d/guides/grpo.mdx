@@ -1,0 +1,53 @@
+---
+title: "GRPO / agent tree search"
+description: "Wire k7d into a GRPO trainer or tree-search agent: fork_batch, protect, prune, auto_evict"
+---
+
+If you already have Kubernetes tasks or scenarios (a Helm chart, a set of YAML manifests, an eval harness that talks to a kube-apiserver), the shape is:
+
+1. **Boot the scenario once** — bring up your cluster (or adopt a running one that k7d already hosts) and wait until it is in the state you want every rollout to start from.
+2. **Root a tree at that checkpoint.**
+3. **For each GRPO group (or tree-search step):** `tree_fork_batch(N)` → run your N policies against the N copies → score → `tree_protect` the winners, `tree_prune` the losers → let the daemon `tree_auto_evict` under your RAM/disk budget.
+4. **Roll forward** from a protected winner when you want the next generation to start from a better state, or `tree_rollback` to an earlier node when you don't.
+
+Your training loop owns rewards and policy. k7d owns environments and budgets.
+
+## Why byte-identical starts matter for GRPO
+
+GRPO (and most group-relative methods) compare rewards *within a group*. If member A starts from a colder cache, a different etcd revision, or a half-ready Deployment than member B, the reward gap is noise, not signal.
+
+A k7d fork is a copy of the live machine — same memory, same disk, same in-cluster TLS sessions, same kube-apiserver state. Every member of the group begins from a **byte-identical** world, then diverges only because of what your policy did. That is the difference between "we reset the env" and "we cloned the universe."
+
+## How your agent talks to the tree
+
+The agent talks JSON-lines over a Unix socket (`/run/k7d/k7d.sock`). The verbs you actually need:
+
+| You want to… | Call |
+|---|---|
+| Start from a warm VM or live cluster | `tree_create` / `tree_create_cluster` / `tree_adopt_cluster` |
+| Open N parallel rollouts from one checkpoint | `tree_fork_batch` |
+| Try again from an earlier node without destroying it | `tree_rollback` |
+| Pin a winner so budget pressure can't kill it | `tree_protect` |
+| Drop a losing subtree | `tree_prune` |
+| Enforce RAM/disk caps now | `tree_auto_evict` |
+
+Full request/response shapes: [Daemon API](/k7d/api/protocol). Budget semantics and LRU eviction: [Snapshot tree](/k7d/concepts/snapshot-tree).
+
+## The demo as a template
+
+A thin Python client that covers exactly this loop lives in [`examples/cluster-tree-search/`](https://github.com/katakate/k7d/tree/main/examples/cluster-tree-search). Treat it as the template for wiring your GRPO trainer — not as a finished SDK.
+
+```bash
+cd examples/cluster-tree-search
+python3 run_demo.py --mode busybox --branches 4      # fast packaging demo
+python3 run_demo.py --mode busybox --branches 50     # the density claim
+python3 run_demo.py --mode inner-k3s --branches 4    # headline path: fork a live k3s cluster
+```
+
+The demo forks N branches from a live checkpoint, scores a trivial reward, protects the winner, prunes the losers, and prints the fork wall-clock. Useful flags: `--keep` (leave the tree around for `tree_nodes` inspection), `--tree-id NAME` (stable tree id), `K7D_SOCKET` (override the control socket).
+
+## Sizing the loop
+
+- A single 3-VM cluster fork is **~105 ms** under API churn; a shared-pause batch of 50 clusters is **~4.1 s** (~82 ms/cluster). See [Benchmarks](/k7d/deep-dives/benchmarks).
+- Forks share memory until they diverge — RAM cost per group member is the dirty pages of its own rollout, not full guest RAM.
+- Set the tree budget to your box: `max_live_vms`, `max_live_ram_bytes`, `max_disk_bytes`. The daemon proactively suspends least-recently-active unprotected nodes at 85% of the RAM budget, so a long training run doesn't OOM the host.
