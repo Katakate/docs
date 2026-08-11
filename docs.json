@@ -109,15 +109,6 @@
             ]
           }
         ]
-      },
-      {
-        "tab": "Blog",
-        "groups": [
-          {
-            "group": "Posts",
-            "pages": ["blog/docker-in-vm-fork"]
-          }
-        ]
       }
     ]
   },
