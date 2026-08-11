@@ -42,7 +42,7 @@ The `config` object accepted by `create_vm` (and the tree-create operations):
 | `kernel` | string | env `K7D_KERNEL` | Guest kernel path |
 | `initrd` | string | env `K7D_INITRD` | Initramfs path |
 | `memory_mb` | u64 | `256` | Guest RAM in MiB |
-| `vcpus` | u32 | `1` | Guest vCPU count. **The VMM is single-vCPU today** — values > 1 are clamped to 1 with a loud warning (multi-vCPU is in progress); the CFS quota below still enforces the pod's CPU limit host-side |
+| `vcpus` | u32 | `1` | Guest vCPU count. Multi-vCPU (SMP) guests are supported; the shim derives the count from the pod's CPU limit (`ceil(quota/period)`, floor 1). Fork/snapshot have full parity across vCPU counts |
 | `cpu_quota` / `cpu_period` | u64 | none | Host CFS quota in µs per period, applied to the VM's vCPU threads. Both set or neither |
 | `vsock` | bool | `true` | Attach a vhost-vsock device (needed for the agent) |
 | `virtiofs` | array | `[]` | virtiofs shares: `{host_dir, guest_mount, readonly}` |

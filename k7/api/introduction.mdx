@@ -75,7 +75,7 @@ Authorization: Bearer <your-key>
 | GET    | `/api/v1/sandboxes/{name}/logs`      | Snapshot of pod logs (no streaming yet) |
 | POST   | `/api/v1/sandboxes/{name}/pause`     | Scale to 0, optionally snapshot the PVC |
 | POST   | `/api/v1/sandboxes/{name}/resume`    | Scale back to 1 |
-| POST   | `/api/v1/sandboxes/{name}/fork`      | Clone source into a new sandbox (kata-qemu-longhorn) |
+| POST   | `/api/v1/sandboxes/{name}/fork`      | Clone source into a new sandbox (kql: disk clone; k7d: warm CoW fork) |
 | POST   | `/api/v1/sandboxes/{name}/snapshot`  | Snapshot a running sandbox without pausing it |
 | GET    | `/api/v1/snapshots`                  | List VolumeSnapshots managed by k7 |
 | GET    | `/api/v1/snapshots/{name}`           | Inspect one VolumeSnapshot |
@@ -83,6 +83,7 @@ Authorization: Bearer <your-key>
 | POST   | `/api/v1/snapshots/{name}/restore`   | Boot a new sandbox from a standalone VolumeSnapshot |
 | POST   | `/api/v1/snapshots/gc`               | Sweep stale `kind=fork` snapshots |
 | GET    | `/api/v1/sandboxes/metrics`          | CPU/memory metrics per sandbox |
+| GET    | `/api/v1/nodes/storage`              | Per-node storage-pool utilization (kfd thin-pool + k7d disk pool) |
 
 <Info>
 Health endpoints:

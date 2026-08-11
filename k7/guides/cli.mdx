@@ -61,10 +61,24 @@ suitable for demos and trusted networks today.
 Install K7 components on host node(s).
 
 ```bash
-k7 install [-v]
+k7 install [-v]                                # localhost, default kata backends
+k7 install --backend kfd,kql,k7d               # pick backends explicitly
+k7 install --backend k7d --k7d-artifact /root/k7d-v0.1.0-x86_64-linux.tar.gz
+k7 install -i inventory.ini --ha               # multi-node HA (3+ servers)
+k7 install --role agent --join https://master:6443 --join-token TOKEN
 ```
 
 - **-v**: verbose output
+- **--backend, -b**: comma-separated backends: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), `k7d`. Default installs the two Kata backends; add `k7d` explicitly for the warm-fork microVM runtime.
+- **--disk**: block device for the kfd LVM thin-pool (auto-detected when omitted).
+- **--k7d-version**: k7d release version to download (k7d backend only).
+- **--k7d-artifact**: local k7d release tarball to install instead of downloading (k7d backend only).
+- **-i, --inventory**: Ansible inventory for multi-node installs (per-host `k7_backends` is authoritative — don't combine with `--backend`).
+- **--ha**: multi-master HA with embedded etcd (inventory with 3+ servers).
+- **--role / --join / --join-token**: add a single node to an existing cluster.
+- **--no-api**: CLI-only install without the k7-api Deployment.
+
+See [Multi-node clusters](/k7/guides/multi-node) for the inventory format and topology.
 
 ## version
 
@@ -267,6 +281,20 @@ Shows container logs (before script and main container).
 k7 top [-n NAMESPACE] [--refresh-interval 1]
 ```
 Top-like view of CPU and memory usage.
+
+## nodes storage
+
+```bash
+k7 nodes storage           # per-node table
+k7 nodes storage --json    # raw JSON
+```
+
+Per-node storage-pool utilization, collected from the `k7-agent` DaemonSet on every node:
+
+- **`kata_thinpool`** — the kfd LVM thin-pool (`lvs` size, data%, metadata%).
+- **`k7d_disks`** — the k7d XFS disk pool at `/var/lib/k7d/disks` (`df` size / used / avail).
+
+A node whose agent is unreachable shows a loud `error` entry — nodes are never silently omitted. Also available as `GET /api/v1/nodes/storage` ([API reference](/k7/api/endpoints/nodes)) and `Client.nodes_storage()` in the SDK.
 
 ## api
 

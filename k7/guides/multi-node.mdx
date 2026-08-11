@@ -14,7 +14,7 @@ Katakate scales horizontally via multi-node K3s clusters, configured with an Ans
 
 ## Topology at a glance
 
-A typical 3-server + 1-agent cluster with mixed backends and Longhorn replication:
+A typical 3-server + 1-agent cluster with mixed backends (including all-backend nodes running k7d) and Longhorn replication:
 
 ```mermaid
 flowchart TB
@@ -37,23 +37,30 @@ flowchart TB
 
             subgraph N1["node1 — server"]
                 direction TB
-                N1Tag["backends: kql + kfd"]
+                N1Tag["backends: kql + kfd + k7d"]
                 A1["k7-api<br/>(Deployment)"]
-                S1["sandbox pods<br/>kata-fc / kata-qemu"]
+                G1["k7-agent<br/>(DaemonSet pod)"]
+                S1["sandbox pods<br/>kata / kata-qemu / k7"]
+                K1["k7d daemon<br/>/run/k7d/k7d.sock"]
                 D1[("LVM thin-pool<br/>/dev/nvme1n1")]
+                P1[("k7d disk pool<br/>/var/lib/k7d/disks")]
                 L1[("Longhorn replica")]
             end
 
             subgraph N2["node2 — server"]
                 direction TB
-                N2Tag["backend: kql"]
-                S2["sandbox pods<br/>kata-qemu"]
+                N2Tag["backends: kql + k7d"]
+                G2["k7-agent<br/>(DaemonSet pod)"]
+                S2["sandbox pods<br/>kata-qemu / k7"]
+                K2["k7d daemon"]
+                P2[("k7d disk pool")]
                 L2[("Longhorn replica")]
             end
 
             subgraph N3["node3 — server"]
                 direction TB
                 N3Tag["backend: kql"]
+                G3["k7-agent<br/>(DaemonSet pod)"]
                 S3["sandbox pods<br/>kata-qemu"]
                 L3[("Longhorn replica")]
             end
@@ -61,7 +68,8 @@ flowchart TB
             subgraph N4["node4 — agent"]
                 direction TB
                 N4Tag["backend: kfd"]
-                S4["sandbox pods<br/>kata-fc"]
+                G4["k7-agent<br/>(DaemonSet pod)"]
+                S4["sandbox pods<br/>kata"]
                 D4[("LVM thin-pool<br/>/dev/nvme1n1")]
             end
         end
@@ -69,6 +77,8 @@ flowchart TB
         N1 -. "etcd" .- CP
         N2 -. "etcd" .- CP
         N3 -. "etcd" .- CP
+
+        A1 -. "k7d VM ops + storage stats<br/>(agent token · CiliumNetworkPolicy)" .-> G2
 
         L1 <-. "replicate<br/>(longhorn_replicas=2)" .-> L2
         L2 <-. "replicate" .-> L3
@@ -82,20 +92,24 @@ flowchart TB
     classDef agent fill:#0b0b0b,stroke:#ef672b,color:#fff;
     classDef store fill:#0b1a0b,stroke:#22c55e,color:#fff;
     classDef etcd fill:#2a1a05,stroke:#ef672b,color:#fff;
+    classDef k7d fill:#1a0b1a,stroke:#a855f7,color:#fff;
     class Client client;
-    class N1,N2,N3,A1,S1,S2,S3,N1Tag,N2Tag,N3Tag server;
-    class N4,S4,N4Tag agent;
-    class D1,D4,L1,L2,L3 store;
+    class N1,N2,N3,A1,S1,S2,S3,N1Tag,N2Tag,N3Tag,G1,G2,G3 server;
+    class N4,S4,N4Tag,G4 agent;
+    class D1,D4,L1,L2,L3,P1,P2 store;
     class CP,E1,E2,E3,CPNote etcd;
+    class K1,K2 k7d;
 ```
 
 What this shows:
 
 - **Any server** can serve the API NodePort — clients can hit any of `node1..3` on `:31007`.
 - **etcd quorum** spans the three servers. One server can fail without losing the control plane.
-- **Backend labels** decide where a sandbox lands. `--backend kfd` is restricted to `node1` and `node4`; `--backend kql` to `node1`, `node2`, `node3`.
+- **Backend labels** decide where a sandbox lands. `--backend kfd` is restricted to `node1` and `node4`; `--backend kql` to `node1`, `node2`, `node3`; `--backend k7d` to `node1` and `node2`.
+- **k7d nodes** run the node-local `k7d` daemon (systemd unit, owns every `runtimeClassName: k7` microVM on that node) plus its XFS disk pool at `/var/lib/k7d/disks`.
+- **The `k7-agent` DaemonSet** runs on every node. The k7-api forwards k7d `pause` / `resume` / `fork` to the agent on the sandbox's node (shared-token auth, ingress restricted to the k7-api pod by a CiliumNetworkPolicy), so k7d VM ops work through the API **regardless of which node hosts the sandbox**. It also serves per-node storage-pool stats for `k7 nodes storage`.
 - **Longhorn replicas** of each `kata-qemu-longhorn` PVC are spread across `kql`-capable nodes (`longhorn_replicas=2` keeps two copies; `dataLocality: best-effort` keeps one local to the pod).
-- **Devmapper thin-pools** are per-node and not replicated — `kata-firecracker-devmapper` sandboxes are ephemeral by design.
+- **Devmapper thin-pools and k7d disk pools** are per-node and not replicated — `kfd` sandboxes are ephemeral by design, and k7d fork/snapshot trees are host-local (a fork lands on the source's node; cross-node fork is on the k7d roadmap).
 
 ## Inventory format
 
@@ -105,8 +119,8 @@ A complete example ([`src/k7/deploy/inventory.ini.example`](https://github.com/K
 
 ```ini
 [k7_servers]
-node1 ansible_host=192.0.2.10 k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
-node2 ansible_host=5.9.18.222 k7_backends=kata-qemu-longhorn
+node1 ansible_host=192.0.2.10 k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper,k7d k7_devmapper_disk=/dev/nvme1n1
+node2 ansible_host=5.9.18.222 k7_backends=kata-qemu-longhorn,k7d
 node3 ansible_host=5.9.18.223 k7_backends=kata-qemu-longhorn
 
 [k7_agents]
@@ -122,6 +136,18 @@ ansible_ssh_private_key_file=~/.ssh/id_ed25519
 longhorn_replicas=2
 ```
 
+For a 3-node HA cluster with **all backends on every node**, one command from the first master brings everything up:
+
+```bash
+k7 install -i inventory.ini --ha --k7d-artifact /root/k7d-v0.1.0-x86_64-linux.tar.gz
+```
+
+Don't pass `--backend` alongside `-i`: the per-host `k7_backends` in the inventory is authoritative (an explicit `--backend` overrides it).
+
+<Note>
+On dual-NVMe boxes where the OS lives on one disk and the other is a raw spare, **omit `k7_devmapper_disk`**: NVMe enumeration (`nvme0n1` vs `nvme1n1`) is not stable across reboots, so a hardcoded device can point at the OS disk after a reboot. The playbook auto-detects the empty non-root whole disk. Set it only when a node has several spare disks and you must pick a specific one.
+</Note>
+
 ### Per-host variables
 
 | Variable | Required | Description |
@@ -129,8 +155,10 @@ longhorn_replicas=2
 | `ansible_host` | yes | SSH target IP or hostname |
 | `ansible_user` | yes | SSH user (commonly `root` on bare-metal) |
 | `k7_backends` | yes | Comma-separated list of backends supported by this node. Values: `kata-qemu-longhorn`, `kata-firecracker-devmapper`, `k7d` |
-| `k7_devmapper_disk` | for `kata-firecracker-devmapper` | **Raw, unformatted** block device for the LVM thin-pool (e.g. `/dev/nvme1n1`). Wipe with `utils/wipe-disk.sh` first. |
+| `k7_devmapper_disk` | for `kata-firecracker-devmapper` | **Raw, unformatted** block device for the LVM thin-pool (e.g. `/dev/nvme1n1`). Usually better left unset — the playbook auto-detects (see note above). Wipe with `utils/wipe-disk.sh` first. |
 | `longhorn_extra_disk` | optional, `kata-qemu-longhorn` only | Existing **mount path** (e.g. `/mnt/longhorn-extra`) to register as an extra Longhorn disk. **Not** a `/dev/...` device — format and mount it yourself first. Without this, Longhorn uses `longhorn_data_path` (default `/var/lib/longhorn`) on the root filesystem. |
+| `kata_thinpool_pv_size` | optional, `kata-firecracker-devmapper` only | LVM PV size for the kfd thin-pool (default `100G`) |
+| `k7d_disks_image_size` | optional, `k7d` only | Sparse XFS image size for the k7d volume pool at `/var/lib/k7d/disks` (default `32G`) |
 
 ### Group variables (`[k7_cluster:vars]`)
 
@@ -162,7 +190,7 @@ A node can advertise both backends in `k7_backends`:
 node1 ansible_host=... k7_backends=kata-qemu-longhorn,kata-firecracker-devmapper k7_devmapper_disk=/dev/nvme1n1
 ```
 
-The playbook installs both Kata runtime classes (`kata-fc` and `kata-qemu`), merges containerd configs, and labels the node with **both**:
+The playbook installs both Kata runtime classes (`kata` and `kata-qemu`), merges containerd configs, and labels the node with **both**:
 
 ```
 k7.katakate.org/backend-kata-qemu-longhorn=true
@@ -227,9 +255,12 @@ sudo k3s kubectl -n kube-system get pods -l k8s-app=cilium
 # Longhorn
 sudo k3s kubectl -n longhorn-system get nodes,replicas
 
-# k7-api pod
-sudo k3s kubectl -n kube-system get deploy/k7-api -o wide
-k7 api-status
+# k7-api pod + per-node k7-agent DaemonSet
+sudo k3s kubectl -n kube-system get deploy/k7-api ds/k7-agent -o wide
+k7 api status
+
+# Per-node storage-pool utilization (thin-pool + k7d disk pool, via the agents)
+k7 nodes storage
 ```
 
 A clean cluster will show all nodes `Ready`, Cilium pods `Running`, the k7-api Deployment with `1/1 ready`, and Longhorn replicas distributed across nodes.

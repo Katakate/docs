@@ -1,0 +1,51 @@
+---
+title: "Nodes"
+description: "Per-node storage-pool utilization"
+---
+
+Endpoint: `GET /api/v1/nodes/storage`
+
+Returns storage-pool utilization for **every node in the cluster**, aggregated from each node's `k7-agent` DaemonSet pod:
+
+- **`kata_thinpool`** — the `kata-firecracker-devmapper` LVM thin-pool (`lvs`: size, data%, metadata%).
+- **`k7d_disks`** — the k7d disk pool, an XFS loopback mount at `/var/lib/k7d/disks` (`df`: size, used, available).
+
+<RequestExample>
+```bash cURL
+curl -H "X-API-Key: $K7_API_KEY" "$BASE/api/v1/nodes/storage"
+```
+</RequestExample>
+
+Example response:
+
+```json
+{
+  "data": {
+    "k7-node-01": {
+      "kata_thinpool": {
+        "vg": "kata_vg",
+        "lv": "kata_thinpool",
+        "size_bytes": 107374182400,
+        "data_percent": 12.4,
+        "metadata_percent": 1.2
+      },
+      "k7d_disks": {
+        "path": "/var/lib/k7d/disks",
+        "size_bytes": 34359738368,
+        "used_bytes": 2147483648,
+        "avail_bytes": 32212254720,
+        "used_percent": 6.25
+      }
+    },
+    "k7-node-02": {
+      "error": "k7-agent storage query failed: HTTP 500: ..."
+    }
+  }
+}
+```
+
+### Behavior
+
+- Pools that don't exist on a node (e.g. a `kql`-only node with no thin-pool) produce an error detail for that field.
+- A node whose `k7-agent` pod is unreachable gets a loud `{"error": ...}` entry — nodes are **never silently omitted**.
+- The same data is available via `k7 nodes storage` (`--json` for the raw payload) and `Client.nodes_storage()` in the Python SDK.

@@ -65,6 +65,7 @@
               "k7/api/endpoints/snapshots",
               "k7/api/endpoints/exec",
               "k7/api/endpoints/metrics",
+              "k7/api/endpoints/nodes",
               "k7/api/endpoints/health"
             ]
           }

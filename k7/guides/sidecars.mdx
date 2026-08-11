@@ -38,7 +38,7 @@ flowchart LR
         CLI -- connects to --> Socket
     end
 
-    Storage[/"Persistent backing for /var/lib/docker:<br/>Longhorn PVC on kata-qemu-longhorn<br/>emptyDir on kata-firecracker-devmapper"/]
+    Storage[/"Persistent backing for /var/lib/docker:<br/>Longhorn PVC on kata-qemu-longhorn<br/>emptyDir on kata-firecracker-devmapper / k7d"/]
     DataDir -. mounted from .-> Storage
 
     classDef vm fill:#0b0b0b,stroke:#ef672b,stroke-width:1px,color:#fff;
@@ -96,6 +96,7 @@ docker compose up
 |---------|------------------|------------------------|----------------|
 | `kata-qemu-longhorn` | Longhorn PVC subdir (`/var/lib/docker` → `<pvc>/docker/`) | ✅ Yes | ✅ Yes (Longhorn snapshot includes it) |
 | `kata-firecracker-devmapper` | `emptyDir` (ephemeral) | ❌ No persistent disk | ❌ |
+| `k7d` | `emptyDir` (VM-lifetime) | ✅ Yes (the VM is frozen in place; memory and disk survive) | ❌ Fork of a sandbox **with a sidecar** is rejected on k7d — use `kql` for that |
 
 On `kata-qemu-longhorn`:
 
@@ -107,6 +108,11 @@ On `kata-firecracker-devmapper`:
 
 - Each pod restart wipes the Docker state.
 - Fork is unavailable on this backend anyway.
+
+On `k7d`:
+
+- Docker data lives for the **lifetime of the VM** — pause/resume keep it (nothing is torn down), but it does not survive pod deletion.
+- k7d's warm fork currently supports single-workload sandboxes only; a sidecar-equipped sandbox cannot be forked.
 
 ## Readiness ordering
 

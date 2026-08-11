@@ -50,9 +50,10 @@ Discover the endpoint with `k7 api endpoint` and the key with `k7 generate-api-k
 | `install(playbook=None, inventory=None, verbose=False)` | `dict` | Trigger an Ansible run via the API. Useful for joining new nodes. |
 | `pause(name, snapshot=None, namespace=...)` | `dict` | Scale to 0; optional VolumeSnapshot name |
 | `resume(name, namespace=...)` | `dict` | Scale back to 1 |
-| `fork(source, new_name, namespace=..., snapshot=None)` | `SandboxProxy` | Clone root disk (kata-qemu-longhorn) |
+| `fork(source, new_name, namespace=..., snapshot=None)` | `SandboxProxy` | kql: disk clone + cold boot; k7d: warm CoW fork (memory + disk) |
 | `restore(snapshot, new_name, overrides=None, keep_snapshot=True)` | `SandboxProxy` | New sandbox from a snapshot |
 | `list_snapshots(...)` / `delete_snapshot(...)` / `gc_snapshots(...)` | varies | Snapshot lifecycle (see [Snapshots API](/k7/api/endpoints/snapshots)) |
+| `nodes_storage()` | `dict` | Per-node kfd thin-pool + k7d disk-pool utilization (see [Nodes API](/k7/api/endpoints/nodes)) |
 
 `SandboxProxy` (returned by `create`) exposes:
 
@@ -127,7 +128,10 @@ wait_until_ready(k7, "secure-sb")
 
 ## Pause, resume, fork
 
-`pause`, `resume`, and `fork` work on `Client` and on the `SandboxProxy` from `create`. Fork clones the root disk via Longhorn `VolumeSnapshot` and requires the **kata-qemu-longhorn** backend.
+`pause`, `resume`, and `fork` work on `Client` and on the `SandboxProxy` from `create`. Behavior depends on the backend:
+
+- **`kata-qemu-longhorn`** — fork clones the root disk via Longhorn `VolumeSnapshot` (the fork cold-boots, ~45 s); pause/resume scale the Deployment and the PVC survives.
+- **`k7d`** — fork is a warm CoW copy of the whole VM (memory + disk + processes, ~5 ms at the VMM, ~2 s end-to-end to a Ready pod); pause/resume freeze and thaw the live VM in place. Works for sandboxes on any node — the API forwards to the per-node `k7-agent` when needed.
 
 ```python
 base = k7.create({

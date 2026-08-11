@@ -30,20 +30,25 @@ flowchart TB
         subgraph DataPlane["Data plane<br/>per node"]
             direction LR
             Cilium["Cilium CNI<br/>NetworkPolicy +<br/>CiliumNetworkPolicy"]
-            Containerd["K3s containerd<br/>+ Kata shim<br/>(kata-fc / kata-qemu)"]
+            Containerd["K3s containerd<br/>+ runtime shims<br/>(kata / kata-qemu / k7)"]
+            Agent["k7-agent<br/>DaemonSet pod<br/>(k7d VM ops · storage stats)"]
+            K7dD["k7d daemon<br/>/run/k7d/k7d.sock"]
         end
 
-        subgraph Sandbox["Sandbox VM (Kata)"]
-            VMM["Firecracker (+ jailer)<br/>or QEMU"]
+        subgraph Sandbox["Sandbox VM"]
+            VMM["Firecracker (+ jailer),<br/>QEMU, or k7d VMM"]
             UserCnt["user container"]
             VMM --- UserCnt
         end
 
-        Storage[("Storage backends<br/>LVM thin-pool · Longhorn PVC")]
+        Storage[("Storage backends<br/>LVM thin-pool · Longhorn PVC · k7d disk pool")]
 
         K3sAPI -- "schedules pod" --> Containerd
         Cilium -. "wires netns" .- Containerd
         Containerd -- "launches" --> VMM
+        API -. "k7d pause/resume/fork<br/>on remote nodes" .-> Agent
+        Agent -. "proxies to" .- K7dD
+        K7dD -- "owns k7d VMs" --> VMM
         VMM -. "rootfs" .- Storage
     end
 
@@ -58,7 +63,7 @@ flowchart TB
     classDef store fill:#0b1a0b,stroke:#22c55e,color:#fff;
     class Client,CLI,SDK,Curl client;
     class ControlPlane,API,K3sAPI,Sched ctrl;
-    class DataPlane,Cilium,Containerd data;
+    class DataPlane,Cilium,Containerd,Agent,K7dD data;
     class Sandbox,VMM,UserCnt vm;
     class Storage store;
 ```
@@ -74,6 +79,10 @@ A Typer-based CLI distributed as a Debian package (`apt install k7`). It wraps `
 A FastAPI service that exposes a REST surface for sandbox lifecycle and exec. The API runs as a **K3s `Deployment`** in `kube-system` with a `NodePort` Service, an in-cluster `ServiceAccount`, and a scoped `ClusterRole`. Stop it with `k7 stop-api` (scale to 0) or `k7 stop-api --delete` (full teardown).
 
 The entire `K7Core` is async (`kubernetes_asyncio` + `httpx`), so the API can serve concurrent requests without thread-pool workarounds.
+
+### Per-node agent — `k7-agent`
+
+A **DaemonSet** in `kube-system` (same image as `k7-api`, running `k7.api.agent:app`) that exposes node-local operations the central API can't do remotely: k7d VM ops (`pause` / `resume` / `fork` / `lookup`, which need the node's `/run/k7d/k7d.sock` and containerd socket) and storage-pool utilization (`GET /agent/v1/storage`). When a k7d sandbox lives on a different node than the k7-api pod, the API forwards the VM op to that node's agent, authenticated with a shared token provisioned by the installer (`/etc/k7/agent_token`) and locked down by a CiliumNetworkPolicy so only the k7-api pod can reach the agents. If no agent is Ready on the target node, the operation fails loudly — never a silent no-op.
 
 ### Python SDK — `k7-sdk`
 
@@ -91,8 +100,10 @@ Cilium is the default CNI plugin. It enables **FQDN-based egress** (e.g. allow `
 
 Kata is the OCI runtime that turns each pod into a lightweight VM. We install both runtime classes:
 
-- `kata-fc` — Firecracker microVMs (used by `kata-firecracker-devmapper`)
+- `kata` — Firecracker microVMs (used by `kata-firecracker-devmapper`)
 - `kata-qemu` — QEMU-based VMs (used by `kata-qemu-longhorn`)
+
+The third runtime class, `k7`, is not Kata: it's the [k7d](/k7d/index) containerd shim (`containerd-shim-k7-v1`) talking to the node-local `k7d` daemon.
 
 ### Backends
 
@@ -100,7 +111,7 @@ A **backend** is a tuple of (runtime class, storage driver). There are three:
 
 | Backend | Alias | Runtime | Storage | Best for |
 |---------|-------|---------|---------|----------|
-| `kata-firecracker-devmapper` | `kfd` | Kata + Firecracker + jailer | LVM thin-pool snapshotter | Lightest footprint, fastest cold boot, ephemeral workloads |
+| `kata-firecracker-devmapper` | `kfd` | Kata + Firecracker + jailer (`kata`) | LVM thin-pool snapshotter | Lightest footprint, fastest cold boot, ephemeral workloads |
 | `kata-qemu-longhorn` | `kql` | Kata + QEMU | Longhorn CSI (replicated PVCs) | Persistent volumes, disk-level snapshot/pause/resume/fork |
 | `k7d` | — | [k7d Rust VMM](/k7d/index) (`runtimeClassName: k7`) | erofs on virtio-blk + host-local state | ~5 ms warm fork, snapshot trees, RL / agent tree search |
 

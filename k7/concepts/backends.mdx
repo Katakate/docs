@@ -13,7 +13,7 @@ A **backend** in Katakate combines a VM runtime with a storage driver. There are
 
 | | `kata-firecracker-devmapper` (`kfd`) | `kata-qemu-longhorn` (`kql`) | `k7d` |
 |--|------------------------------|-----------------------|-------|
-| Runtime class | `kata-fc` | `kata-qemu` | `k7` |
+| Runtime class | `kata` | `kata-qemu` | `k7` |
 | Hypervisor | Firecracker (microVM) via Kata | QEMU via Kata | [k7d](/k7d/index) — purpose-built Rust VMM |
 | Process isolation | **Jailer** (chroot, dropped caps, seccomp) | Kata's built-in sandboxing | KVM hardware isolation (see [k7d security model](/k7d/concepts/security)) |
 | Storage driver | LVM thin-pool + containerd devmapper snapshotter | Longhorn CSI (replicated PVCs) | erofs images on virtio-blk + host-local state |
@@ -63,8 +63,11 @@ k7 install --backend kfd --disk /dev/nvme2n1   # pin the thin-pool disk explicit
 k7 install --backend kql                       # kata-qemu-longhorn only, no raw disk needed
 k7 install --backend kql --longhorn-extra-disk /mnt/longhorn-extra   # optional extra storage
 k7 install --backend k7d                       # k7d runtime (daemon + shim + RuntimeClass k7)
+k7 install --backend k7d --k7d-version 0.1.0   # pin the k7d release to download
+k7 install --backend k7d --k7d-artifact /root/k7d-v0.1.0-x86_64-linux.tar.gz   # install from a local tarball
 k7 install --backend kfd,kql --disk /dev/nvme2n1 --longhorn-extra-disk /mnt/longhorn-extra   # multiple, explicit
 k7 install -i inventory.ini                    # multi-node, per-host backends
+k7 install -i inventory.ini --ha               # multi-master HA (3+ servers, embedded etcd)
 ```
 
 ### At sandbox creation time
@@ -106,5 +109,8 @@ If the requested backend isn't available on any node, you'll see a clear `Failed
 
 - Pods run as k7d microVMs via `runtimeClassName: k7` — a small containerd shim talks to the `k7d` daemon over `/run/k7d/k7d.sock`.
 - Fork copies the **whole VM**: memory, disk, processes, and network identity — not just the disk. Warm fork is ~5 ms.
-- Multi-vCPU guests are **in progress** — the daemon boots 1 vCPU today; the pod's CPU limit is still enforced host-side via CFS quota.
+- Multi-vCPU guests are supported: the vCPU count is derived from the pod's CPU limit (`cpu: "2"` boots a 2-vCPU guest), with fork/snapshot parity.
+- **VM ops work for sandboxes on any node.** The k7d daemon and its socket are node-local, but `k7 pause` / `resume` / `fork` through the API are forwarded to the `k7-agent` DaemonSet pod on the sandbox's node when needed. A fork still lands on the **source's node** (cross-node fork is on the k7d roadmap).
+- Warm fork works for single-workload sandboxes; forking a sandbox with a sidecar is rejected (use `kql` for that).
+- Per-node k7d disk-pool utilization is visible via `k7 nodes storage` (see [CLI reference](/k7/guides/cli)).
 - See [RuntimeClass k7](/k7d/guides/runtime-class) for how the runtime is registered, and the [feature matrix](/k7d/guides/feature-matrix) for current Kubernetes feature support.
