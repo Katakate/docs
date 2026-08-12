@@ -200,7 +200,7 @@ Endpoint: `GET /api/v1/sandboxes/{name}/logs`
 
 Returns a snapshot of the pod's container logs. Live `follow` streaming
 isn't shipped yet — use `k7 --core logs --follow ...` on a cluster node
-for tail-and-follow until a future spec adds streaming.
+for tail-and-follow until API streaming lands.
 
 <ParamField path="name" type="string" required>Sandbox name</ParamField>
 <ParamField query="namespace" type="string" default="default">Namespace</ParamField>
