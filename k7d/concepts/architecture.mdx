@@ -59,6 +59,7 @@ k7d is three cooperating pieces of Rust plus a minimal guest image:
 - **No async in the VMM.** Plain threads + `Arc<Mutex<...>>`; only the shim is tokio-based (containerd's shim protocol is async). Every cross-thread signal is an eventfd.
 - **Errors are loud.** Typed errors per module, no silent fallbacks, no `unwrap()` in library code. Resources (KVM fds, TAP devices, virtiofsd children) are cleaned up via `Drop` — drop order is deliberate so device worker threads never touch freed guest memory.
 - **Rootfs via erofs on virtio-blk.** Read-only host paths are packed into cached erofs images and attached as block devices. This is what keeps cluster forks CoW: no per-fork memory copies for filesystem shares (the pre-14a virtiofs path forced a full memory copy per fork and survives only as the fallback for read-write hostPath).
+- **CNI is the host network contract, not a Flannel special case.** When `network.pod_netns` is set, the daemon moves the TAP into the CNI-provided pod netns so the VM answers on the pod IP. That path follows the CNI netns + eth0 + pod IP contract; it works the same if Flannel is replaced or disabled (`--flannel-backend=none`).
 
 ## The "start a pod" path
 

@@ -48,16 +48,19 @@ One pinned bare-metal node (~€40/month Hetzner) used for all figures:
 | Cluster-tree resume (3 VMs) | 750 ms | ~40 ms quiet |
 | VM shutdown | 5 ms | ~0.05 ms |
 | Pool acquire (pooled `create_vm` round trip) | 100 ms | ~50 ms |
+| Daemon tree fork (control-plane path) | 500 ms | — |
+| Pod network ready (CNI netns attach) | 50 ms | — |
+| Warm fork 2-vCPU / CoW restore 2-vCPU | 75 ms / 35 ms | — |
 
 ## Reproduce
 
 On a node with the repo and toolchain installed:
 
 ```bash
-# Full enforced suite (fmt + deny + clippy + all tests, --test-threads=1):
-make check
+# Full enforced suite on the Hetzner node (rsync + fmt + deny + clippy + all tests):
+make remote-check
 
-# Headline path only:
+# Headline path only (on the node, after make rsync):
 cargo test -p k7d --test test_inner_k3s \
   test_inner_k3s_cluster_warm_fork_no_restart \
   -- --test-threads=1 --nocapture
