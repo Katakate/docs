@@ -97,6 +97,35 @@ spec:
 **CPU limits and vCPUs:** the shim derives the guest's vCPU count from the pod's CPU limit (`cpu: "2"` boots a 2-vCPU guest), and the limit is additionally enforced on the host via a CFS quota on the VM's vCPU threads. Fork and snapshot preserve multi-vCPU state.
 </Note>
 
+## Sizing writable storage
+
+A container's writes go to an overlay upper on the sandbox's **scratch disk** — a sparse ext4 image on the host, attached as a read-write virtio-blk device — not to guest RAM. Writable capacity is therefore independent of the pod's memory limit, and filling it gives the writing process an ordinary `ENOSPC` rather than guest-wide memory pressure.
+
+Size it per pod (default **8 GiB**):
+
+```yaml
+metadata:
+  annotations:
+    k7d.katakate.org/scratch-size: 20Gi
+```
+
+That image is shared by the pod, so one container filling it also fails its siblings. To scope the blast radius, give individual containers their own image with a `name=size` list over container names:
+
+```yaml
+metadata:
+  annotations:
+    k7d.katakate.org/scratch-size: 8Gi                      # shared, everyone else
+    k7d.katakate.org/container-scratch-size: builder=2Gi,logger=64Mi
+```
+
+Each named container gets a whole filesystem of its own, so an overrun is its own `ENOSPC` while siblings keep writing. Containers you don't name go on sharing the pod's scratch disk.
+
+<Note>
+Per-container scratch is opt-in for two reasons: each image spends one of the VM's virtio-MMIO device slots, and a pod that uses it is served by a fork rather than from the warm pool. A warm fork gets a reflink-CoW copy of every image, so a fork's writes — and its usage numbers — are isolated from its parent and its siblings.
+</Note>
+
+Kubernetes itself cannot see any of this: the CRI carries no ephemeral-storage figure in either direction, so `resources.limits.ephemeral-storage` never reaches the runtime and these annotations are the only sizing input. Usage is measured inside the guest and surfaced in the shim log, not in `kubectl top`.
+
 ## Because VMs outlive shims
 
 The daemon owns the VMs, so a containerd restart or shim crash does not kill your workloads: a freshly respawned shim resolves its sandbox back to the still-running VM via the daemon's `reattach_sandbox` operation, which also verifies the guest agent still answers before handing the VM back.
