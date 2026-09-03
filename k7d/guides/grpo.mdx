@@ -1,6 +1,6 @@
 ---
 title: "GRPO / agent tree search"
-description: "Wire k7d into a GRPO trainer or tree-search agent: fork_batch, protect, prune, auto_evict"
+description: "Wire k7d into a GRPO trainer, a tree-search agent, or an MCP-driven frontier model: fork_batch, protect, prune, auto_evict"
 ---
 
 If you already have Kubernetes tasks or scenarios (a Helm chart, a set of YAML manifests, an eval harness that talks to a kube-apiserver), the shape is:
@@ -30,24 +30,42 @@ The agent talks JSON-lines over a Unix socket (`/run/k7d/k7d.sock`). The verbs y
 | Pin a winner so budget pressure can't kill it | `tree_protect` |
 | Drop a losing subtree | `tree_prune` |
 | Enforce RAM/disk caps now | `tree_auto_evict` |
+| Make waiting free | `auto_warp` / `dilation` — see [Time warp](/k7d/guides/time-warp) |
+| Watch the tree change | `tree_watch` — one streaming connection, one event per mutation |
 
 Full request/response shapes: [Daemon API](/k7d/api/protocol). Budget semantics and LRU eviction: [Snapshot tree](/k7d/concepts/snapshot-tree).
 
-## The demo as a template
+## Three reference clients
 
-A thin Python client that covers exactly this loop lives in [`examples/cluster-tree-search/`](https://github.com/katakate/k7d/tree/main/examples/cluster-tree-search). Treat it as the template for wiring your GRPO trainer — not as a finished SDK.
+All three live in the repo's [`examples/`](https://github.com/katakate/k7d/tree/main/examples) and talk to the daemon over the socket. None is a finished SDK; each is the template for one way of driving the tree.
+
+### `cluster-tree-search/` — the trainer loop
+
+A thin Python client that covers exactly the loop above:
 
 ```bash
 cd examples/cluster-tree-search
 python3 run_demo.py --mode busybox --branches 4      # fast packaging demo
 python3 run_demo.py --mode busybox --branches 50     # the density claim
-python3 run_demo.py --mode inner-k3s --branches 4    # headline path: fork a live k3s cluster
+python3 run_demo.py --mode inner-k3s --branches 4    # fork a live k3s cluster
 ```
 
 The demo forks N branches from a live checkpoint, scores a trivial reward, protects the winner, prunes the losers, and prints the fork wall-clock. Useful flags: `--keep` (leave the tree around for `tree_nodes` inspection), `--tree-id NAME` (stable tree id), `K7D_SOCKET` (override the control socket).
 
+### `k7d-mcp/` — a frontier agent with a fork button
+
+A stdio MCP server that wraps the tree for Cursor CLI / Claude Code / Codex-style agents. The agent gets `tree_status`, `fork_batch(node_id, n)`, `branch_exec(node_id, member, cmd)`, `tetragon_diff(node_id)`, and `protect` / `prune` / `rollback` — every call appends one JSONL line (tool, args, latency, tree usage).
+
+The shipped scenario plants a self-healing miner in a live Ubuntu Cilium + Tetragon cluster. The agent does not touch production first: it forks the cluster three ways, tries delete / scale-to-zero / watch on the copies, learns the miner respawns, forks again from the copy that already knows that, and replays only the winning pair of moves on the source. One lab is left broken on purpose; no rollback needed. [Video](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-mcp-demo.mp4) · [how it works](https://github.com/katakate/k7d/blob/main/docs/demo/README.md) · [JSONL](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-mcp-demo.jsonl).
+
+### `k7view/` — the observer
+
+A read-only dashboard: one SSE stream over `tree_list` / `tree_nodes` / `tree_watch`, a vsock probe thread that pings live agents for real RTT and `/proc/loadavg`, click-to-protect / evict. Fork latency chips are the daemon's `latency_ns`; the UI never invents a number or a parent edge. [The incident seen from the tree](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-tree-view.mp4) · [a ×8 dilated tree recorded in real time](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-dilated-tree.mp4).
+
 ## Sizing the loop
 
-- A single 3-VM cluster fork is **~105 ms** under API churn; a shared-pause batch of 50 clusters is **~4.1 s** (~82 ms/cluster). See [Benchmarks](/k7d/deep-dives/benchmarks).
-- Forks share memory until they diverge — RAM cost per group member is the dirty pages of its own rollout, not full guest RAM.
-- Set the tree budget to your box: `max_live_vms`, `max_live_ram_bytes`, `max_disk_bytes`. The daemon proactively suspends least-recently-active unprotected nodes at 85% of the RAM budget, so a long training run doesn't OOM the host.
+- A single 3-VM cluster fork is **~105 ms** on the minimal CI guest under API churn and **~1.1 s** on Ubuntu k3s + Cilium + Tetragon; a shared-pause batch of 50 CI-guest clusters is **~3.85 s** (~77 ms/cluster). See [Benchmarks](/k7d/deep-dives/benchmarks).
+- Forks share memory until they diverge — RAM cost per group member is the dirty pages of its own rollout, not full guest RAM. Three idle k3s nodes dirty ~20% of guest RAM in 30 s (page-cache churn), so plan for that floor.
+- Forking *from* a child costs a keyframe first: O(divergence), ~0.8 s idle / ~1.1 s under Kafka-style churn for 3 × 2 GiB. Fork from the root or from protected checkpoints when you can; `tree_prepare_fork_source` lets you pay it at a moment of your choosing.
+- Set the tree budget to your box: `max_live_vms`, `max_live_ram_bytes`, `max_disk_bytes`. The daemon proactively suspends least-recently-active unprotected nodes at 85% of the RAM budget, so a long training run doesn't OOM the host. `tree_nodes` and `tree_list` report live `usage` against the `budget`.
+- If an episode is mostly waiting, run the tree with `auto_warp` `jump` (zero fidelity cost, 1.83× on a probe-heavy episode) or fork children at `dilation: 8` (8× on the same episode, bounded fidelity cost). [Time warp](/k7d/guides/time-warp) has the trade-off table.

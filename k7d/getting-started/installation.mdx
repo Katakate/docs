@@ -1,6 +1,6 @@
 ---
 title: "Installation"
-description: "Install k7d from a release tarball or build from source, then fork your first cluster"
+description: "Five-minute quickstart, install from a release tarball or build from source, then fork your first cluster"
 ---
 
 ## Requirements
@@ -9,13 +9,52 @@ description: "Install k7d from a release tarball or build from source, then fork
   name; release tarballs use `x86_64`). `/dev/kvm` must exist. Bare metal or
   a cloud instance with nested virtualization both work. k7d does not build
   or run on macOS / Windows / ARM.
-- **root** — the daemon manages TAP devices, bridges, and `/run/k7d/`.
+- **`/dev/vhost-vsock`**, **`/dev/net/tun`**, and **cgroup v2** — the
+  daemon talks to guest agents over vsock, gives each VM a TAP, and jails
+  each tree in a cgroup.
+- **root** — the daemon manages TAP devices, bridges, nftables, and
+  `/run/k7d/`.
 - Optional: **k3s**, if you want pods scheduled as k7d microVMs via
   [`runtimeClassName: k7`](/k7d/guides/runtime-class).
 
+`k7d doctor` runs exactly these checks without starting a daemon:
+
 ```bash
-ls /dev/kvm   # must exist before anything else
+k7d doctor
+# ok    kvm  /dev/kvm
+# ok    vhost_vsock  /dev/vhost-vsock
+# ok    tun  /dev/net/tun
+# ok    cgroup_v2  ...
+# doctor: ok — host can run k7d
 ```
+
+Exit code is non-zero on any `FAIL`.
+
+The same report is available on the socket as `{"op":"doctor"}` — see
+the [Daemon API](/k7d/api/protocol).
+
+## Five-minute quickstart
+
+From a clone or a clean box:
+
+```bash
+git clone https://github.com/Katakate/k7d && cd k7d
+sudo ./scripts/quickstart.sh
+```
+
+The script doctor-checks the host, fetches the release tarball and guest
+artifacts if they are not already present, starts `k7d`, boots a busybox
+3-node tree, forks 4 branches, and prints the wall-clocks next to both
+rows of the two-clocks table. `k7d doctor` and `k7d quickstart` are the
+same verbs on an already-installed binary:
+
+```bash
+k7d doctor                 # host checks; does not start a daemon
+k7d quickstart             # 3-node busybox tree + 4 forks (daemon must be up)
+```
+
+Overrides: `K7D_RELEASE_URL` (tarball), `K7D_PREFIX` (default
+`/usr/local`), `K7D_SOCKET` (default `/run/k7d/k7d.sock`).
 
 ## Install from a release tarball
 
@@ -23,8 +62,8 @@ Each release ships a self-contained tarball with the daemon, the
 containerd shim, the guest kernel, the guest initramfs, and an installer.
 
 ```bash
-tar xzf k7d-v0.1.0-x86_64-linux.tar.gz
-cd k7d-v0.1.0-x86_64-linux
+tar xzf k7d-v0.4.0-x86_64-linux.tar.gz
+cd k7d-v0.4.0-x86_64-linux
 sudo ./install.sh
 ```
 
@@ -45,7 +84,14 @@ Verify:
 ```bash
 systemctl status k7d
 ls /run/k7d/k7d.sock
+k7d --version
 ```
+
+<Note>
+`k7d --version` and `k7d --help` answer and exit without touching the
+running daemon. The daemon also refuses to start if a live listener
+already owns the socket path — it never displaces a running instance.
+</Note>
 
 ### Registering with k3s
 
@@ -71,19 +117,36 @@ git clone https://github.com/Katakate/k7d && cd k7d
 make release    # daemon, shim, guest kernel, rootfs → dist/
 ```
 
-`make release` produces the same tarball layout under `dist/` — run
-`sudo ./install.sh` from there, or start the daemon directly for a quick
-look:
+`make release` produces the same tarball layout under
+`dist/k7d-v<version>-x86_64-linux/` (daemon, shim, `vmlinux`,
+`initramfs.cpio.gz`, `runc.amd64`, `install.sh`, `quickstart.sh`) plus
+the `.tar.gz` — run `sudo ./install.sh` from there, or start the daemon
+directly for a quick look:
 
 ```bash
-sudo RUST_LOG=info ./dist/k7d &
+cd dist/k7d-v0.4.0-x86_64-linux
+sudo K7D_KERNEL=$PWD/vmlinux K7D_INITRD=$PWD/initramfs.cpio.gz RUST_LOG=info ./k7d &
 ```
+
+The daemon is the only process that chooses a guest kernel and initramfs.
+Without `K7D_KERNEL` / `K7D_INITRD` it refuses to create a VM rather than
+guessing. [`HACKING.md`](https://github.com/katakate/k7d/blob/main/HACKING.md)
+covers the remote-node development loop, the verification suite, and the
+kubectl integration tests.
+
+### Ubuntu node images
+
+The tarball's guest is the minimal busybox initramfs. To run stock
+Ubuntu 24.04 guests (k3s + Cilium + Tetragon + Longhorn, the ~1.1 s fork
+clock), build a node image once with
+`guest/ubuntu/build-node-image.sh` — see [Ubuntu nodes](/k7d/guides/ubuntu-nodes).
 
 ## Fork your first cluster
 
-The repository ships a demo that boots a live 3-VM k3s cluster once, then
-forks it into parallel branches, scores them, keeps the winner, and
-prunes the rest — printing the fork wall-clock as it goes.
+`k7d quickstart` is the shortest path. The repository also ships a demo
+that boots a live 3-VM k3s cluster once, then forks it into parallel
+branches, scores them, keeps the winner, and prunes the rest — printing
+the fork wall-clock as it goes.
 
 ```bash
 cd examples/cluster-tree-search
@@ -94,8 +157,8 @@ python3 run_demo.py --mode busybox --branches 50
 ```
 
 Everything the demo does goes through the JSON-lines protocol on
-`/run/k7d/k7d.sock` — the same verbs your own trainer would call. See the
-[daemon API](/k7d/api/protocol) for the full verb list and the
+`/run/k7d/k7d.sock` — the same verbs your own trainer would call. See
+the [daemon API](/k7d/api/protocol) for the full verb list and the
 [GRPO guide](/k7d/guides/grpo) for wiring it into a training loop.
 
 ## Next steps
@@ -104,8 +167,14 @@ Everything the demo does goes through the JSON-lines protocol on
 <Card title="Cluster mode" icon="network-wired" href="/k7d/guides/cluster-mode">
 Create or adopt an N-node k3s cluster and fork it without agent restarts.
 </Card>
+<Card title="Ubuntu nodes" icon="ubuntu" href="/k7d/guides/ubuntu-nodes">
+Stock Ubuntu 24.04 guests with k3s, Cilium, Tetragon, Longhorn.
+</Card>
 <Card title="GRPO / tree search" icon="sitemap" href="/k7d/guides/grpo">
 fork_batch, protect, prune, auto_evict under RAM budgets.
+</Card>
+<Card title="Time warp" icon="forward-fast" href="/k7d/guides/time-warp">
+Compress idle guest time with lockstep jumps or ×N dilation.
 </Card>
 <Card title="RuntimeClass k7" icon="dharmachakra" href="/k7d/guides/runtime-class">
 Schedule Kubernetes pods as k7d microVMs.

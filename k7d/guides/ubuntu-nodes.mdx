@@ -1,0 +1,123 @@
+---
+title: "Ubuntu nodes"
+description: "Stock Ubuntu 24.04 guests as bare k7d VMs: build the node image, boot a k3s cluster with Cilium, Tetragon, or Longhorn, and fork it live"
+---
+
+k7d ships two guests. The **minimal CI guest** — a busybox initramfs with the k7-agent as PID 1 — is what the release tarball installs, what `runtimeClassName: k7` pods boot, and what the ~105 ms cluster-fork clock is measured on. The **Ubuntu node** is a stock Ubuntu 24.04 root disk with systemd as PID 1 and the distro `-virtual` kernel, booted by `create_vm` with no initramfs. It runs the real thing: k3s' own containerd, Cilium, Tetragon, Longhorn, Kubeflow, KubeRay — and still warm-forks, at the ~1.1 s clock.
+
+Both guests go through the same VMM. The delta is entirely userspace.
+
+| | Minimal CI guest | Ubuntu node |
+|---|---|---|
+| Init | k7-agent (PID 1) | systemd; k7-agent as a unit |
+| Kernel | k7d's own minimal `vmlinux` | Ubuntu `linux-image-virtual` (+ `extra` modules for haltpoll, Cilium, Longhorn) |
+| Root | initramfs | sparse ext4 image on the reflink XFS, `root=/dev/vda` |
+| Default size | 256 MiB / 1 vCPU | 2 GiB / 2 vCPU (Longhorn: 4 GiB / 4 vCPU) |
+| Boot → agent | ~163–205 ms | ~3.2 s |
+| 3-node k3s fork | **~105 ms** (1 s budget) | **~1.1 s** agent path; 420–700 ms in isolated tests (1 s ceiling) |
+| Host RAM per k3s node | ~3.2 GiB (fixture) | ~1.1–1.4 GiB |
+
+## Build the node image
+
+`guest/ubuntu/build-node-image.sh` builds one pristine image. Every input is pinned (Ubuntu cloud-image tarball digest, apt package list, k3s artifacts, the agent binary, the helper scripts) and the output is content-keyed, so an unchanged input set never rebuilds and any change produces a new image rather than a stale hit.
+
+```bash
+sudo OUT_DIR=/var/lib/k7d/disks/base-images guest/ubuntu/build-node-image.sh
+# → ubuntu-24.04-<key>.img      ext4 root disk, sparse, pristine
+#   ubuntu-24.04-<key>.vmlinuz  the kernel copied out of that disk
+#   ubuntu-24.04-<key>.json     manifest: digests, kernel, masked units and why
+```
+
+Requires root (loop mount + chroot), network for apt, and an `OUT_DIR` on a reflink-capable filesystem — the daemon's `/var/lib/k7d/disks` XFS is the intended home. The image bakes in k3s (airgap images imported offline), `open-iscsi` + `nfs-common` for Longhorn, the k7-agent unit, and 25 VM-useless systemd units masked (each recorded in the manifest with a reason).
+
+Never boot a VM from the pristine image. Reflink a per-VM copy first (`cp --reflink=always`); the copy is O(1) and shares every extent until written.
+
+## The boot contract
+
+Everything an Ubuntu node needs to know arrives on the kernel command line — one image, role decided at boot, nothing to discover:
+
+```text
+console=ttyS0 noapic reboot=k panic=1 pci=off net.ifnames=0
+root=/dev/vda rootfstype=ext4 rw mitigations=off
+clocksource=kvm-clock cpuidle_haltpoll.force=1 haltpoll.guest_halt_poll_ns=200000 …
+k7d.ip=10.200.0.2/24,10.200.0.1,eth0
+k7d.k3s=server,10.200.0.2,<token>
+k7d.cni=none
+```
+
+| Token | Meaning |
+|---|---|
+| `k7d.ip=<addr>/<prefix>,<gateway>,<iface>` | Static networking, applied by a oneshot unit before k3s |
+| `k7d.k3s=server\|agent,<server-ip>,<token>` | Which k3s unit to start and how to join. Agents wait for the server's `/readyz` before joining. Absent = k3s stays disabled |
+| `k7d.cni=flannel\|none` | `none` turns off flannel, kube-proxy, and k3s' network-policy controller so Cilium owns the datapath. Absent = flannel. Any other value fails the boot loudly |
+
+This is a *replacement* command line, not an addition to the minimal guest's: there is no `rdinit=/init` and no initramfs. Pass it as `VmConfig.cmdline`.
+
+## Boot a 3-node cluster and root a tree at it
+
+Members of an Ubuntu cluster need different command lines (IP, role) and their own root disk, so create them one by one on a shared bridge, then adopt the set as a cluster tree:
+
+```json
+{"op": "create_vm", "config": {
+  "kernel": "/var/lib/k7d/disks/base-images/ubuntu-24.04-<key>.vmlinuz",
+  "memory_mb": 2048, "vcpus": 2,
+  "cmdline": "… root=/dev/vda … k7d.ip=10.200.0.2/24,10.200.0.1,eth0 k7d.k3s=server,10.200.0.2,<token>",
+  "block_devices": [{"host_path": "/var/lib/k7d/disks/ubuntu-t1-0.img", "readonly": false}],
+  "network": {"cluster_id": "t1", "vm_index": 0}
+}}
+{"op": "create_vm", "config": {"…": "vm_index 1, k7d.ip=10.200.0.3/24,…, k7d.k3s=agent,10.200.0.2,<token>"}}
+{"op": "create_vm", "config": {"…": "vm_index 2, k7d.ip=10.200.0.4/24,…"}}
+```
+
+Wait for the agents over vsock, then for `kubectl get nodes` to show 3 Ready (kubeconfig comes out of the server over the agent's `read_file`; ~39–42 s for k3s with flannel). Then:
+
+```json
+{"op": "tree_adopt_cluster", "vm_ids": ["vm-…", "vm-…", "vm-…"], "tree_id": "t1", "budget": {"…": "…"}}
+```
+
+Adoption writes the root keyframe (a full memory dump, ~8 s for 3 × 2 GiB — the only full dump the tree ever needs; children take O(divergence) [reflink keyframes](/k7d/concepts/snapshot-tree#keyframes)). From here it is an ordinary cluster tree: `tree_fork_batch`, `tree_protect`, `tree_prune`, [time warp](/k7d/guides/time-warp). The forked child's root disk is a `FICLONE` reflink of the source's (~2500 shared extents), so the fork is CoW on both memory and disk.
+
+`kernel` must be the Ubuntu `vmlinuz`; leave `initrd` out. The daemon never substitutes the busybox pair for a disk-booted guest.
+
+## What runs inside, and forks
+
+All of these are proven by an integration test that brings the workload up on the source, warm-forks the cluster, and checks both sides keep working and then diverge independently. Versions are pinned.
+
+| Workload | How | Fork (3 × 2 GiB unless noted) |
+|---|---|---|
+| k3s `v1.32.5+k3s1`, flannel | baked in the image, `k7d.k3s=` | 488 ms |
+| **Cilium 1.16.10** (eBPF datapath, kube-proxy replacement, CiliumNetworkPolicy) | `k7d.cni=none` + host `helm install` | 416 ms |
+| **Tetragon 1.7.0** (fork-and-diff of the event stream) | host Helm on the Cilium cluster | 453–551 ms |
+| **Longhorn 1.12.1** (RWO + RWX PVCs) | host Helm; 4 GiB / 4 vCPU nodes; a named `data_disks` entry per node at `/var/lib/longhorn` | 538–696 ms (3 root + 3 data disks) |
+| Mock GPU + DCGM (`nvidia.com/gpu` from a real kubelet device plugin, dcgm-exporter-shaped scrape) | manifests | 458 ms |
+| JobSet v0.12.0 on mock GPUs | digest-pinned | 298 ms |
+| Kubeflow Trainer v2.2.1 (TrainJob) on mock GPUs | digest-pinned | under 1 s |
+| Kueue v0.19.2 on mock GPUs (quota admits one, holds the second) | digest-pinned | under 1 s |
+| KubeRay v1.7.0 (CPU head + GPU worker) | digest-pinned | 580 ms |
+| Soft-RoCE (`rdma_rxe` on guest `eth0`, `rdma link` + `ibv_devinfo` on ≥2 nodes) | in-guest | 540 ms |
+
+<Warning>
+The ML rows are **mocks** — a fake device plugin and a fake metrics endpoint. They prove the operators and the schedulers fork; they are not CUDA, not NCCL, not GPUDirect, not a PyTorch runtime.
+</Warning>
+
+Image pulls are the long pole, not the fork: Cilium to 3/3 Ready is ~190 s after Helm, Longhorn ~350 s. The fork of the finished cluster stays under the 1 s ceiling in every row. Full tables: [Benchmarks](/k7d/deep-dives/benchmarks).
+
+## Persistent data disks
+
+An Ubuntu node's root disk is ephemeral like any other VM disk — `stop_vm` deletes it. Storage nodes need a disk that outlives the VM, so `VmConfig.data_disks` attaches **named** ext4 images:
+
+```json
+"data_disks": [{"id": "longhorn-0", "size_bytes": 17179869184, "guest_mount": "/var/lib/longhorn"}]
+```
+
+The image `data/<id>.img` is created sparse and formatted on first use, reused as-is on every later attach, and only `delete_data_disk` removes it. A `size_bytes` that disagrees with the existing image is an error, not a resize. On a warm fork every data disk is reflinked with the memory, so the child's Longhorn replicas diverge from the parent's without a byte copy. Each disk costs one virtio-blk slot out of the guest's device budget.
+
+## Guest hardening
+
+The node image ships two AppArmor profiles. `k7-agent` may create `AF_VSOCK` — it is the harness's control plane. Everything else, including every pod (CRI AppArmor is disabled so pods inherit the node profile), runs under `k7-deny-vsock`: unconfined minus the vsock address family. A rogue workload inside a forked cluster cannot open a channel to the host. Combined with the [tree network jail](/k7d/concepts/security#the-tree-jailer) on the host side, a compromised guest is contained to its own bridge.
+
+## Related pages
+
+- [Cluster mode](/k7d/guides/cluster-mode) — adopt, fork, suspend, resume as one unit
+- [Feature matrix](/k7d/guides/feature-matrix) — every in-cluster feature and which guest proves it
+- [Daemon API](/k7d/api/protocol) — `VmConfig.cmdline`, `block_devices`, `data_disks`

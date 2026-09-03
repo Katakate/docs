@@ -14,7 +14,7 @@ k7d uses formal methods **where they pay off** — selected critical pieces are 
 
 A VMM is a machine for doing address arithmetic next to `unsafe` blocks: guest-physical to host-virtual translation, initrd placement, GDT encoding, page-table entries, dirty-bitmap indexing. A single off-by-one silently corrupts a guest.
 
-[Kani](https://model-checking.github.io/kani/) is a bounded model checker for Rust: it explores **every input within a bound** and proves no panic, overflow, or out-of-bounds access occurs. Proof harnesses are co-located with the code they verify (`#[cfg(kani)]` modules with `#[kani::proof]` functions at the bottom of the VM, fork, snapshot, and device modules).
+[Kani](https://model-checking.github.io/kani/) is a bounded model checker for Rust: it explores **every input within a bound** and proves no panic, overflow, or out-of-bounds access occurs. Proof harnesses are co-located with the code they verify — `#[cfg(kani)]` modules with `#[kani::proof]` functions at the bottom of `vm.rs`, `fork.rs`, `snapshot.rs`, `block.rs` (virtio-blk request-header parsing and I/O byte-offset bounds), and `mptable.rs` (the SMP MP table fits below 640 KiB and its size is monotone in the vCPU count).
 
 ```bash
 make kani     # run the harnesses (minutes, not hours)
@@ -22,20 +22,33 @@ make kani     # run the harnesses (minutes, not hours)
 
 Complementing Kani, every `unsafe` block carries a `// SAFETY:` comment (lint-enforced), Miri runs over the non-KVM unit tests, and libFuzzer runs over the agent protocol and virtio-blk request parsing.
 
-## Aeneas → Lean: the tree budget model
+## Aeneas → Lean: the tree model
 
 The [snapshot tree](/k7d/concepts/snapshot-tree)'s budget and eviction bookkeeping decides which VMs live, which get suspended, and which state gets deleted. A bookkeeping bug here means OOM-ing the host or evicting a protected winner mid-training-run.
 
-That logic is factored into a pure, side-effect-free Rust module. [Aeneas](https://aeneasverif.github.io/) (via [Charon](https://github.com/AeneasVerif/charon)) translates it to [Lean](https://lean-lang.org/), where theorems about the model — budget invariants, eviction ordering, protection being honored — are proved and re-checked whenever the model changes:
+That logic is factored into a pure, side-effect-free Rust module (`tree_model.rs`). [Aeneas](https://aeneasverif.github.io/) (via [Charon](https://github.com/AeneasVerif/charon)) translates it to [Lean](https://lean-lang.org/), where theorems are proved and re-checked whenever the model changes:
 
 ```bash
 make verif-gen verif-build     # regenerate the Lean model + build the proofs
 ```
 
+The proofs are grouped by what a failure would cost:
+
+| Group | Property |
+|---|---|
+| Tree shape | `add_child` preserves well-formedness (unique ids, consistent parent/child links, parent id strictly below child id); every parent chain terminates at a root |
+| Budget accounting | `usage().live_ram_bytes` and `live_vm_count` are exactly the saturating sums over Live nodes |
+| Eviction policy | the LRU victim is an eligible (Live, non-exempt, non-protected) node with minimal `last_active`, and `None` only when nothing is eligible; implicit protection covers every ancestor of a protected node; `restore_chain_depth` is exact hop-by-hop with checkpoint reset |
+| Eviction loop | `auto_evict_ram` terminates, its post-condition holds (RAM back under budget or no eligible victim left), and it preserves well-formedness |
+| Keyframe delta codec | the header and per-page entry encoders round-trip through their parsers |
+| Latency budget | the warm-fork budget equals its base at zero dirty pages and is monotone in dirty-page count |
+
+The theorems are stated against hand-written Lean mirrors; a separate equivalence layer (`verif/Verif/Equiv/`) proves the mirrors match the Aeneas-generated translation of the Rust, so a regeneration that renames a generated identifier breaks only that layer, never the theorems.
+
 The translation is guarded: any Rust primitive that Aeneas cannot model lands in the generated Lean as a bodyless axiom, and the build **fails** if an axiom appears that is not on an explicit allowlist. New unprovable constructs must be refactored away rather than silently assumed.
 
 ## What is *not* verified
 
-Everything else: the virtio device implementations, the KVM run loop, the network dataplane, the shim, the agent. Those rely on the conventional arsenal — the type system, integration tests with [enforced latency budgets](/k7d/deep-dives/benchmarks), fuzzing, Miri, and a deliberately small codebase (≤25k lines for VMM + shim).
+Everything else: the virtio device implementations, the KVM run loop, the network dataplane and jail, the clock-warp machinery, the shim, the agent. Those rely on the conventional arsenal — the type system, integration tests with [enforced latency budgets](/k7d/deep-dives/benchmarks), fuzzing, Miri, and a deliberately small codebase (≤30k lines for VMM + shim).
 
 See the repo's [verification setup](https://github.com/katakate/k7d/tree/main/verif) for the Lean sources and axiom allowlist.

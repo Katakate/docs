@@ -30,9 +30,17 @@ A `NetworkPolicy` blocks **all inter-VM ingress traffic by default**. Practical 
 
 ## Egress control
 
-Egress is configured per sandbox with `egress_whitelist`:
+A sandbox has exactly one of three egress modes:
 
-| Value | Behavior |
+| Mode | CLI | YAML / API | Result |
+|------|-----|------------|--------|
+| **block-all** | `k7 create …` (no egress flag) | `egress_whitelist: []` | deny-all egress NetworkPolicy |
+| **whitelist** | `--egress <entry>` (repeatable) | `egress_whitelist: [<entries>]` | only listed CIDRs / FQDNs |
+| **open** | `--egress-open` | omit `egress_whitelist` (or `null`) | no egress policy |
+
+`--egress-open` and `--egress` are mutually exclusive. Defaults are **asymmetric** (kept for compatibility): the CLI without flags is **block-all**; an API/YAML request that omits `egress_whitelist` is **open**.
+
+| `egress_whitelist` value | Behavior |
 |-------|----------|
 | Field omitted (or `null`) | Egress fully open — sandbox can reach the internet |
 | `[]` (empty list) | Egress fully blocked. **DNS is also blocked.** |
@@ -72,7 +80,7 @@ spec:
         - "10.0.0.5/32"
 ```
 
-Wildcards (`*.example.com`) are supported via Cilium's `matchPattern`. Bare exact names use `matchName`.
+Wildcards (`*.example.com`) are supported via Cilium's `matchPattern`. Bare exact names use `matchName`. A leading `*.` covers subdomains at **any depth** (`registry.docker.com` *and* `production.cloudfront.docker.com`) but **not** the apex `docker.com` — add the apex as its own entry. Under the hood k7 maps `*.` to Cilium's multi-label `**.` `matchPattern` so CDN-backed registries work. The install also sets Cilium `dnsProxy.minTtl=3600` so clients that cache a resolved IP longer than a short CDN TTL keep the FQDN→IP allowance for an hour.
 
 ### When DNS is blocked
 

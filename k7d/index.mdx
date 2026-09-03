@@ -1,32 +1,56 @@
 ---
 title: "K7d"
 sidebarTitle: "Introduction"
-description: "Fork a running Kubernetes cluster in ~100 ms. Run 50 copies on one 64 GB box."
+description: "Fork a live Kubernetes cluster. Two clocks: ~105 ms (minimal CI guest) and ~1.1 s (Ubuntu k3s+Cilium+Tetragon). Then warp the guest clock so waiting is free."
 ---
 
 <Frame>
-<img src="/k7d/k7d-cover.png" alt="k7d: fork isolated Kubernetes clusters in ~100 ms" />
+<img src="/k7d/k7d-cover.png" alt="k7d: fork isolated Kubernetes clusters — two clocks, ~105 ms and ~1.1 s" />
 </Frame>
 
-k7d is a Rust VMM that forks running VMs — including a live multi-VM Kubernetes cluster — in ~100 ms, with memory, disk, processes, and network identity intact. Boot once, then explore dozens of byte-identical worlds for RL and agent evals. For sandboxes at scale with a CLI / API / Python SDK, see [K7](/k7/index).
+k7d is a Rust VMM that forks running VMs — including a live multi-VM Kubernetes cluster — with memory, disk, processes, and network identity intact. Boot once, then explore dozens of byte-identical worlds for RL and agent evals.
+
+Two clocks, always together: **~105 ms** to fork the minimal CI guest (a busybox initramfs running k3s, test-enforced 1 s budget) and **~1.1 s** to fork a 3-node **Ubuntu 24.04** cluster running k3s + Cilium + Tetragon (48 s source bring-up). Forks share memory until they diverge, so 50 CI-guest copies of a cluster fit on one 64 GB box.
+
+k7d also owns the guest clock. An episode that is mostly *waiting* — readiness probes, backoffs, reconcile ticks — does not have to wait in wall time: lockstep clock jumps compress an 8.7-minute guest-time episode **1.83×** with zero fidelity delta, and continuous KVM time dilation runs guests at **8× wall**. See [Time warp](/k7d/guides/time-warp).
+
+For sandboxes at scale with a CLI / API / Python SDK, see [K7](/k7/index).
 
 <CardGroup cols={2}>
-<Card title="CoW fork" icon="bolt" href="/k7d/concepts/cow-fork">
-How a 5 ms VM fork works: shared memory until write, dirty pages, byte-identical copies.
+<Card title="Installation" icon="download" href="/k7d/getting-started/installation">
+`scripts/quickstart.sh` — doctor-check the host, fetch the release, boot a 3-node tree, fork 4 branches. Five minutes.
 </Card>
-<Card title="GRPO / tree search" icon="sitemap" href="/k7d/guides/grpo">
-Wire k7d into a trainer: fork_batch, protect, prune, auto_evict under RAM budgets.
+<Card title="CoW fork" icon="bolt" href="/k7d/concepts/cow-fork">
+How a 5 ms VM fork works: shared memory until write, dirty pages, reflink keyframes, byte-identical copies.
 </Card>
 <Card title="Cluster mode" icon="network-wired" href="/k7d/guides/cluster-mode">
 Create or adopt an N-node k3s cluster and fork it without agent restarts.
 </Card>
+<Card title="Ubuntu nodes" icon="ubuntu" href="/k7d/guides/ubuntu-nodes">
+Stock Ubuntu 24.04 guests: k3s, Cilium, Tetragon, Longhorn, ML operators on mock GPUs — all forked live.
+</Card>
+<Card title="Time warp" icon="forward-fast" href="/k7d/guides/time-warp">
+Lockstep clock jumps and ×N dilation: delete idle wall time without touching what the guest computes.
+</Card>
+<Card title="GRPO / tree search" icon="sitemap" href="/k7d/guides/grpo">
+Wire k7d into a trainer or an MCP agent: fork_batch, protect, prune, auto_evict under RAM budgets.
+</Card>
 <Card title="Daemon API" icon="code" href="/k7d/api/protocol">
-JSON-lines protocol on /run/k7d/k7d.sock — every tree and VM verb.
+JSON-lines protocol on /run/k7d/k7d.sock — every VM, tree, and clock verb.
 </Card>
 <Card title="Benchmarks" icon="gauge-high" href="/k7d/deep-dives/benchmarks">
-Hardware, exact commands, and every enforced latency budget.
+Hardware, exact commands, and every enforced latency budget — both clocks.
+</Card>
+<Card title="Security model" icon="lock" href="/k7d/concepts/security">
+One daemon, many VMs; what the tree jailer (nft, cgroup, seccomp) contains and what it does not.
 </Card>
 <Card title="Formal verification" icon="shield-halved" href="/k7d/deep-dives/formal-verification">
 Kani on unsafe paths; Aeneas→Lean on the tree budget model.
 </Card>
 </CardGroup>
+
+## Watch it
+
+- [A frontier agent with a fork button](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-mcp-demo.mp4) — an MCP agent forks a live Ubuntu Cilium+Tetragon cluster three ways to peel a planted incident. [How the demo works](https://github.com/katakate/k7d/blob/main/docs/demo/README.md).
+- [The same incident seen from the tree](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-tree-view.mp4) — `examples/k7view/`, a read-only SSE dashboard on the snapshot tree.
+- [A ×8 dilated fork tree recorded in real time](https://github.com/katakate/k7d/blob/main/docs/assets/k7d-dilated-tree.mp4) — guests run at `dilation: 8`; fork latency chips are wall-clock.

@@ -60,7 +60,7 @@ Secure forkable VM sandboxed compute for AI agents and workloads.
 <Card title="K7d" icon="/k7d/k7d-logo.png" href="/k7d/index">
 <img src="https://img.shields.io/github/stars/katakate/k7d?style=flat&logo=github&label=stars&color=ef672b&logoColor=white" alt="stars" height="16" style={{borderRadius: '8px'}} />
 
-A purpose-built Rust VMM: fork a running Kubernetes cluster in ~100 ms, or a single VM in ~5 ms.
+A purpose-built Rust VMM: fork a running Kubernetes cluster (~105 ms minimal guest, ~1.1 s Ubuntu k3s+Cilium+Tetragon) or a single VM in ~5 ms, and warp the guest clock so idle time costs nothing.
 
 <p>
 <Tag bg="#ef672b">KVM</Tag>

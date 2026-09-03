@@ -62,16 +62,16 @@ Install K7 components on host node(s).
 
 ```bash
 k7 install [-v]                                # localhost, default kata backends
-k7 install --backend kfd,kql,k7d               # pick backends explicitly
-k7 install --backend k7d --k7d-artifact /root/k7d-v0.1.0-x86_64-linux.tar.gz
+k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
+k7 install --backend k7d --k7d-artifact /root/k7d-v0.2.1-x86_64-linux.tar.gz
 k7 install -i inventory.ini --ha               # multi-node HA (3+ servers)
 k7 install --role agent --join https://master:6443 --join-token TOKEN
 ```
 
 - **-v**: verbose output
 - **--backend, -b**: comma-separated backends: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), `k7d`. Default installs the two Kata backends; add `k7d` explicitly for the warm-fork microVM runtime.
-- **--disk**: block device for the kfd LVM thin-pool (auto-detected when omitted).
-- **--k7d-version**: k7d release version to download (k7d backend only).
+- **--disk**: block device for the kfd LVM thin-pool (auto-detected when omitted). On dual-NVMe boxes leave this unset — NVMe names swap across reboots.
+- **--k7d-version**: k7d release to download (k7d backend only). k7 **0.2.2+** playbook default is `0.2.1`. PPA `k7` 0.2.1 still defaults to k7d 0.1.0 — pass `--k7d-version 0.2.1`.
 - **--k7d-artifact**: local k7d release tarball to install instead of downloading (k7d backend only).
 - **-i, --inventory**: Ansible inventory for multi-node installs (per-host `k7_backends` is authoritative — don't combine with `--backend`).
 - **--ha**: multi-master HA with embedded etcd (inventory with 3+ servers).
@@ -96,16 +96,20 @@ Create a sandbox from a YAML file or flags.
 k7 create -f k7.yaml
 # or
 k7 create --name my-sb --image alpine:latest \
-  --cpu 1 --memory 1Gi --storage 2Gi \
+  --backend k7d --cpu 1 --memory 1Gi --storage 2Gi \
   --env-file .env --egress 10.0.0.5/32 \
   --before-script "apk add curl"
+
+# Egress: no flag = block-all; --egress CIDR|FQDN (repeatable); --egress-open = no policy
+k7 create --name open --image alpine:latest --egress-open
 ```
 
 ## pause
 
-Scale a sandbox to 0 replicas, optionally taking a crash-consistent
-`VolumeSnapshot` of its root PVC. Snapshots are kata-qemu-longhorn-only and use the
-`longhorn` `VolumeSnapshotClass` registered by the install playbook.
+On **kql**, scale a sandbox to 0 replicas, optionally taking a crash-consistent
+`VolumeSnapshot` of its root PVC (`longhorn` `VolumeSnapshotClass`). On **k7d**,
+pause freezes the live VM in place (vCPUs stop, memory stays) — no snapshot.
+`--snapshot` is kata-qemu-longhorn-only.
 
 ```bash
 k7 pause NAME                       # scale to 0, no snapshot
@@ -127,7 +131,8 @@ k7 pause NAME -n my-ns --snapshot   # with namespace
 k7 resume NAME [-n NAMESPACE]
 ```
 
-Scales the deployment back to 1. State persisted on the root PVC survives.
+On **kql**, scales the Deployment back to 1; state on the root PVC survives.
+On **k7d**, restarts the vCPU loop — in-memory state is intact.
 
 ## restore
 
@@ -164,15 +169,20 @@ k7 restore v1 demo-v1 --image python:3.12-slim
 
 ## fork
 
-Clone an existing sandbox to a new sandbox. With the `kata-qemu-longhorn` backend, the root disk PVC (`<sandbox>-root-lh`) is cloned via a crash-consistent VolumeSnapshot.
+Clone an existing sandbox. Behavior depends on the backend:
+
+- **`k7d`** — warm CoW fork of **disk and memory** (~5 ms at the VMM, ~2–4 s end-to-end to a Ready pod). The child inherits files, tmpfs, and running processes. Lands on the source's node. Sidecar-equipped sandboxes cannot be forked on k7d.
+- **`kql` / `kata-qemu-longhorn`** — disk-only clone via a crash-consistent VolumeSnapshot of `<sandbox>-root-lh`, then a cold boot (~45 s single-node; longer with Longhorn replicas ≥ 2).
+- **`kfd`** — rejected.
 
 ```bash
 k7 fork source-sandbox new-sandbox [--snapshot custom-name]
 ```
 
+On kql only:
+
 - `--snapshot` (optional): friendly name for the temporary VolumeSnapshot. If omitted, an auto-named `<source>-fork-<unix>` snapshot is created and **auto-deleted** once the new sandbox's PVC is bound.
 - Pass `--snapshot=NAME` to opt the snapshot out of GC (it becomes a `named` snapshot — persistent).
-- Storage scope: disk-only (no memory/CPU/network). One root PVC per sandbox; forks get their own cloned PVC.
 
 ## snapshot
 
@@ -195,10 +205,12 @@ k7 snapshot gc [-n NS] [-A] [--keep-fork-for 10m] [--dry-run]
 All fields map to the server-side `SandboxConfig`:
 
 - **name** (string, required): unique sandbox name.
-- **image** (string, required): container image, e.g. `alpine:latest`.
+- **image** (string, required): container image, e.g. `alpine:latest`. Registry host must be public and on the allowlist (`registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`; extend with `K7_REGISTRY_ALLOWLIST`).
+- **backend** (string, optional): `kata-firecracker-devmapper` / `kfd`, `kata-qemu-longhorn` / `kql`, or `k7d`.
+- **sidecar** (string, optional): sidecar type, e.g. `docker`.
 - **namespace** (string, default `default`): Kubernetes namespace.
 - **env_file** (string, optional): (absolute) path to an env file on the host node.
-- **egress_whitelist** (array of CIDR strings, optional): allowed egress IPs, e.g. `"1.1.1.1/32"` for single hosts or `"10.0.0.0/8"` for ranges.
+- **egress_whitelist** (array of CIDR or FQDN strings, optional): omit / `null` = open egress; `[]` = block-all; listed entries = allowlist. FQDNs need Cilium (the default CNI). CLI `k7 create` without `--egress` / `--egress-open` is block-all.
 - **limits** (object, optional): resource limits:
   - **cpu** (string): cores or millicores, e.g. `"1"` or `"500m"`.
   - **memory** (string): e.g. `"1Gi"`, `"512Mi"`.
@@ -215,6 +227,7 @@ Example `k7.yaml`:
 ```yaml
 name: project-build
 image: alpine:latest
+backend: k7d            # or kfd / kql
 namespace: default
 egress_whitelist:
   - "10.0.0.5/32"      # Private egress proxy/gateway
@@ -326,12 +339,14 @@ for one release and print a one-line warning pointing at the new home.
 ## API keys
 
 ```bash
-k7 generate-api-key NAME [--expires-days 365]
+k7 generate-api-key NAME [--expires-days 365] [-n NAMESPACE]
 k7 list-api-keys
 k7 revoke-api-key NAME
 ```
 
 Keys are stored at `/etc/k7/api_keys.json`. Use with `X-API-Key` or `Authorization: Bearer`.
+
+`-n` / `--namespace` (repeatable) scopes the key to one or more namespaces. A scoped key cannot read or mutate another namespace and cannot perform all-namespaces list/GC. Omit `-n` for unrestricted access (backward compatible). `k7 list-api-keys` shows the scope (`*` = unrestricted).
 
 ### Flag reference (create)
 
@@ -339,11 +354,15 @@ Keys are stored at `/etc/k7/api_keys.json`. Use with `X-API-Key` or `Authorizati
 - **-f, --file**: YAML config file (defaults to `k7.yaml` when using `k7 create`).
 - **--name**: Sandbox name (when not using YAML).
 - **--image**: Container image (when not using YAML).
+- **-b, --backend**: `kfd` / `kql` / `k7d` (or the long names).
+- **--sidecar**: Sidecar type (e.g. `docker`).
 - **--cpu**: CPU limit (e.g., `1`, `500m`).
 - **--memory**: Memory limit (e.g., `1Gi`, `512Mi`).
 - **--storage**: Ephemeral storage limit (e.g., `2Gi`).
+- **--root-disk-size**: Longhorn root PVC size (`kql` only; default `10Gi`).
 - **--env-file**: Path to env file on the host node injected as a Secret.
-- **--egress CIDR**: Repeatable; whitelist CIDR blocks for egress (omit to keep open; use none for full block).
+- **--egress ENTRY**: Repeatable; whitelist CIDR or FQDN. Default (no flag): **block all**.
+- **--egress-open**: Allow all egress. Mutually exclusive with `--egress`.
 - **--before-script**: Shell script to run once after container start; runs with open egress before lockdown.
 - **--entrypoint**: Repeatable; override image ENTRYPOINT (ordered).
 - **--cmd**: Repeatable; override image CMD (ordered).

@@ -1,11 +1,13 @@
 ---
 title: "Benchmarks"
-description: "Named hardware, exact commands, and enforced latency budgets for every claim"
+description: "Named hardware, exact commands, and enforced latency budgets for every claim — both fork clocks, keyframes, and time warp"
 ---
 
-Reproducible numbers for the claim: **warm-fork a live multi-VM Kubernetes cluster in well under a second**, with TLS sessions surviving and the source cluster still answering.
+Reproducible numbers for the claim: **warm-fork a live multi-VM Kubernetes cluster in well under a second on the minimal guest and in about a second on a stock Ubuntu distro cluster**, with TLS sessions surviving and the source cluster still answering.
 
 Every number below is an **integration-test assertion**, not a one-off benchmark paste. The budget constants live in [`crates/k7d/src/latency.rs`](https://github.com/katakate/k7d/blob/main/crates/k7d/src/latency.rs) (the single source of truth, imported by the tests) and are documented in [`LATENCY_BUDGETS.md`](https://github.com/katakate/k7d/blob/main/LATENCY_BUDGETS.md). If a number here drifts from those files, **trust the tests**. Budgets are set at roughly 2× the typical observed value.
+
+Cluster-tree fork budgets are asserted on the daemon's own `latency_ns`, not on the client's round trip around the Unix socket. Tests print both; a client RTT over budget while the daemon stays under is a finding, not a failure.
 
 ## Hardware
 
@@ -20,57 +22,141 @@ One pinned bare-metal node (~€40/month Hetzner) used for all figures:
 | Devices | `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`, virtiofsd |
 | Runtime | k3s + RuntimeClass `k7` + `k7d.service` |
 
-## Headline results (enforced + measured)
+## Two clocks
+
+| Guest | Fork | Bring-up | Enforced |
+|---|---|---|---|
+| **Minimal CI guest** (busybox initramfs, inner k3s, under API churn) | **~105 ms** | already warm | 1 s |
+| **Ubuntu 24.04 k3s + Cilium + Tetragon** (agent path) | **~1.1 s/fork** | **48 s** source | 1 s ceiling on the isolated tests (420–700 ms there) |
+| Warm single-VM fork (`<25%` dirty) | ~5 ms | — | 50 ms |
+| **50 × 3-VM** CI-guest cluster-tree forks (shared pause) | **~3.85 s** (~77 ms/cluster) | already warm | 20 s |
+| VM boot → guest agent ready (cold, CI guest) | ~194–205 ms | — | 250 ms |
+
+## Headline results — minimal CI guest
 
 | Operation | Enforced budget | Typical / measured | Test |
 |---|---|---|---|
 | Warm single-VM fork (`<25%` dirty) | 50 ms | ~5 ms | `test_fork_warm_under_50ms` |
 | 10× warm fork batch | 200 ms | ~15 ms | `test_fork_warm_batch_10` |
 | On-host 3-VM cluster warm fork (busybox) | 150 ms | ~25–40 ms quiet / ~70–100 ms loaded | `test_cluster_fork_warm_3vm_under_50ms` |
-| Cluster-tree fork (busybox, 3 VMs) | 750 ms | ~75 ms quiet | `test_cluster_tree_fork_under_75ms` |
+| Cluster-tree fork (busybox, 3 VMs) | 750 ms | ~75 ms quiet; ~188 ms with the tree jail on | `test_cluster_tree_fork_under_75ms` |
 | Cluster warm fork batch (8× 3 VMs) | 2 s | shared pause; beats 8× single ceiling | `test_cluster_fork_warm_batch_8` |
-| Cluster-tree fork batch (50× 3 VMs) | 20 s | **~4.1 s** (~82 ms/cluster) shared pause + parallel materialise | `test_cluster_tree_fork_batch_50` |
-| **Inner-k3s cluster-tree fork (3 VMs)** | **1 s** | **~104 ms** under churn (pause Deployment scale + ConfigMap/pause-pod storm); CoW path (~70 ms on-host `fork_cluster_warm`) | `test_inner_k3s_cluster_warm_fork_no_restart` |
+| Cluster-tree fork batch (50× 3 VMs) | 20 s | **~3.85 s** (~77 ms/cluster) with the full net jail; 2.44 s with the jail off | `test_cluster_tree_fork_batch_50` |
+| **Inner-k3s cluster-tree fork (3 VMs)** | **1 s** | **~104 ms** under churn (Deployment scale + ConfigMap/pause-pod storm); CoW path ~70 ms on-host | `test_inner_k3s_cluster_warm_fork_no_restart` |
+| Lockstep guest-clock warp (cluster) | 250 ms | ~0.4 ms for the ioctls | `test_warp_clock_moves_a_live_cluster_in_lockstep` |
 
-## Full budget table
+### Inner-k3s add-on profiles
+
+Same 3-VM fixture with one stock add-on switched on, plus load churn. Deltas are against the ~104 ms lean baseline. All share the 1 s budget except ArgoCD, which gets its own 2 s.
+
+| Profile | Typical fork | Test |
+|---|---|---|
+| + CoreDNS | ~175 ms | `test_inner_k3s_coredns_dns_fork` |
+| + ServiceLB / Traefik Ingress | ~206 ms | `test_inner_k3s_ingress_fork` |
+| + local-path PVC | ~200 ms | `test_inner_k3s_local_path_pvc_fork` |
+| + metrics-server | ~196 ms | `test_inner_k3s_metrics_server_fork` |
+| + NetworkPolicy | ~195 ms | `test_inner_k3s_network_policy_fork` |
+| + HPA (CPU-metrics scale-up) | ~200 ms | `test_inner_k3s_hpa_scale_fork` |
+| + embedded etcd datastore | ~200 ms | `test_inner_k3s_etcd_datastore_fork` |
+| + ArgoCD core + git server | ~203–213 ms (2 s budget) | `test_inner_k3s_argocd_gitops_fork` |
+| + Cilium (native routing, kube-proxy replacement) | under 1 s | `test_inner_k3s_cilium_datapath_fork` |
+
+## Headline results — Ubuntu nodes
+
+Stock Ubuntu 24.04 root disk, systemd, distro kernel; 3 VMs at 2 GiB / 2 vCPU unless noted. Boot ceilings are loose hang detectors (600 s), not 2× typical. Every fork row reuses one 1 s ceiling, which is also the sub-second target; missing it is a recorded finding, not a silent pass.
+
+| Operation | Ceiling | Typical | Test |
+|---|---|---|---|
+| Ubuntu boot → agent on vsock (1 VM) | 120 s | ~3.2 s | `test_ubuntu_guest_boots_to_agent_with_systemd_network_and_clock` |
+| Ubuntu warm fork (1 VM, 2 GiB) | 250 ms | ~112 ms; child systemd `running` 7.5 ms later (resumed, not re-reached) | `test_ubuntu_guest_warm_fork` |
+| k3s boot → 3 nodes Ready | 600 s | 39–42 s | `test_ubuntu_k3s_three_node_cluster_deliveries` |
+| **k3s cluster warm fork** (flannel) | 1 s | **488 ms** | `test_ubuntu_k3s_cluster_warm_fork_no_restart` |
+| Cilium 1.16.10 pull → 3/3 Ready | 600 s wait | ~190 s after Helm | `test_ubuntu_cilium_datapath_fork` |
+| **Cilium cluster warm fork** | 1 s | **416 ms** | same |
+| **Tetragon 1.7.0 cluster warm fork** | 1 s | **453 ms** (full suite) / 551 ms (isolated); event-to-inject on the child 455 ms | `test_ubuntu_tetragon_fork_event_diff` |
+| **Longhorn 1.12.1 cluster warm fork** (3 × 4 GiB, 3 root + 3 data disks) | 1 s | **538–696 ms**; ~1.1 s when run last in a 66-minute suite (load-sensitive) | `test_ubuntu_longhorn_fork_volumes` |
+| Mock GPU + DCGM cluster warm fork | 1 s | 458 ms | `test_ubuntu_ml_mocks_gpu_dcgm_fork` |
+| JobSet on mock GPUs | 1 s | 298 ms | `test_ubuntu_ml_jobset_gpu_fork` |
+| KubeRay on mock GPUs | 1 s | 580 ms | `test_ubuntu_ml_kuberay_gpu_fork` |
+| Soft-RoCE | 1 s | 540 ms | `test_ubuntu_ml_rdma_soft_roce_fork` |
+| Host RAM per Ubuntu k3s node | finding | ~1.1–1.4 GiB | — |
+
+Six CoW disks and twice the guest RAM (Longhorn) still fork inside the ceiling the 2 GiB clusters were measured against: fork cost tracks the number of devices and page tables, not the volume of storage behind them. The pull is the long pole every time, not the fork.
+
+## Keyframes: O(divergence)
+
+A fork point below the root clones the nearest ancestor's `memory.bin` with `FICLONE` and writes only that node's dirty pages. 3 × 2 GiB Ubuntu k3s, 30 s of divergence each; ceiling 4.5 s (~2× the worst level):
+
+| Keyframe | Time | Physical bytes |
+|---|---|---|
+| Root (full dump) | 7.79 s | 6.00 GiB |
+| Child, idle | **0.78 s** | 1.18 GiB (19.6%) |
+| Child, k8s churn | **0.84 s** | 1.66 GiB (27.8%) |
+| Child, Kafka | **1.14 s** | 3.06 GiB (51.0%) |
+
+Test: `test_keyframe_cost_ubuntu_divergence_levels`. The bytes are the daemon's `base_disk_bytes`; `du` and `stat` cannot measure a reflinked file. Neither the keyframe nor the full dump it replaces is fsynced — syncing a patched reflinked file costs 2–5 s per member because every written page breaks a shared extent.
+
+## Time warp
+
+An 8.7-minute guest-time episode on a fresh 3-node Ubuntu k3s cluster, three runs per arm (`make warp-bench`, a Criterion bench kept out of `make check` for its runtime):
+
+| Arm | Wall | Fidelity |
+|---|---|---|
+| Stock clock | 522 s | — |
+| `auto_warp` `jump` | **286 s (1.83×)** | zero delta: same probe failures, restarts, leases, splats |
+| Continuous dilation ×8 (KVM patch) | **79 s (8.00×)** | bounded: `fsync` 2.3 → 14 ms guest-visible, pod RTT 0.69 → 0.92 ms, churn 86 → 37 rounds |
+| Both | 76 s (8.11×) | do not stack |
+
+The dilation N sweep (compression exactly N through 16; extra probe failures 0 / 0 / 0 / 3 / 19 / 32 for N ∈ {1, 2, 4, 8, 12, 16}) and the fork-of-a-dilated-VM tests need the carried KVM patch loaded (`make dilation-install`; [`utils/kvm-dilation/`](https://github.com/katakate/k7d/tree/main/utils/kvm-dilation)) and are kept out of `make check`. See [Time warp](/k7d/guides/time-warp).
+
+## Full budget table (minimal guest)
 
 | Operation | Budget | Typical |
 |---|---|---|
 | VM build (KVM + memfd + virtiofsd) | 150 ms | ~62 ms |
-| VM boot → agent ready | 250 ms | ~163 ms |
+| VM boot → agent ready | 250 ms | ~194–205 ms |
 | Agent ping RTT | 1 ms | ~0.2 ms |
 | Agent exec RTT | 2 ms | ~0.5 ms |
-| Virtiofs read / write | 2 ms | ~1 ms |
+| Virtiofs read / write | 2 ms | ~1 ms / ~1.14 ms |
 | Snapshot 256 MB VM | 500 ms | ~228 ms |
 | CoW restore from snapshot | 10 ms | ~3 ms |
 | Fork (cold source) | 600 ms | ~250 ms |
-| Cluster-tree suspend (3 VMs) | 750 ms | ~25 ms quiet |
-| Cluster-tree resume (3 VMs) | 750 ms | ~40 ms quiet |
+| Cluster-tree suspend / resume (3 VMs) | 750 ms each | ~25 ms / ~40 ms quiet |
 | VM shutdown | 5 ms | ~0.05 ms |
 | Pool acquire (pooled `create_vm` round trip) | 100 ms | ~50 ms |
-| Daemon tree fork (control-plane path) | 500 ms | — |
-| Pod network ready (CNI netns attach) | 50 ms | — |
+| Pod network ready (CNI netns attach) | 50 ms | ~5–10 ms over boot |
+| Pod volumes setup (per-pod kubelet-volume bind tree) | 250 ms | ~25–40 ms |
 | Warm fork 2-vCPU / CoW restore 2-vCPU | 75 ms / 35 ms | — |
 
 ## Reproduce
 
-On a node with the repo and toolchain installed:
+On a node with the repo and toolchain installed (see [`HACKING.md`](https://github.com/katakate/k7d/blob/main/HACKING.md) for the remote loop):
 
 ```bash
-# Full enforced suite on the Hetzner node (rsync + fmt + deny + clippy + all tests):
-make remote-check
+# Full enforced suite (fmt + deny + clippy + all tests, one VM-booting binary at a time):
+make check                       # on the node
+make remote-check                # from anywhere, K7_NODE_IP set
 
-# Headline path only (on the node, after make rsync):
+# Minimal-guest headline path:
 cargo test -p k7d --test test_inner_k3s \
-  test_inner_k3s_cluster_warm_fork_no_restart \
-  -- --test-threads=1 --nocapture
+  test_inner_k3s_cluster_warm_fork_no_restart -- --test-threads=1 --nocapture
 
-# Packaging demo (busybox, fast):
-cd examples/cluster-tree-search && python3 run_demo.py --mode busybox --branches 4
+# Ubuntu headline path (builds the node image on first run):
+cargo test -p k7d --test test_ubuntu_tetragon \
+  test_ubuntu_tetragon_fork_event_diff -- --test-threads=1 --nocapture
 
 # Scale check — shared-pause batch of 50× 3-VM clusters:
 cargo test -p k7d --test test_cluster_tree \
   test_cluster_tree_fork_batch_50 -- --test-threads=1 --nocapture
+
+# Keyframe cost at three divergence levels:
+cargo test -p k7d --test test_keyframe_cost -- --test-threads=1 --nocapture
+
+# Two-arm time-warp benchmark (~10 min guest time per run + bring-up):
+make warp-bench
+
+# Five-minute try path, no toolchain:
+sudo ./scripts/quickstart.sh
 ```
 
 The inner-k3s test prints a line like:
@@ -84,17 +170,21 @@ daemon: fork_cluster_warm '…': 3 VMs in 69.703248ms
 
 Before the block-rootfs work, cluster pods carried a virtiofs share for the k3s hostPath — so every fork forced a full memory copy of 3 × ~3.2 GiB, landing at ~2 s typical. Moving read-only hostPath mounts to cached **erofs images on virtio-blk** (zero virtiofs shares) let every member fork `MAP_PRIVATE` + dirty-page CoW: **~105 ms** under a 1 s budget. The share-less fork prep also preserves the source's vsock CID, so `kubectl exec` against the source still works after adopt/fork.
 
+The Ubuntu clock is a different guest — systemd and a full distro rootfs instead of a busybox initramfs — through the same VMM. Its root disk forks as a reflink on the daemon's XFS (~2500 shared extents per child), so the fork is CoW on disk as well as memory.
+
 ## Comparison (honest)
 
-| Operation | kind | vcluster | CubeSandbox-style sandbox clone | **k7d** |
-|---|---|---|---|---|
-| Fresh isolated Kubernetes | ~30–60 s cold | ~20 s | n/a (not a cluster) | **warm fork of a live 3-node cluster (~105 ms typical)** |
-| Unit of fork | n/a | n/a | one microVM / process sandbox | **the whole cluster** (control plane + workers) |
-| Surviving TLS across fork | n/a | n/a | no (new sandbox) | **yes** (a held `?watch=true` stream survives) |
-| Source still answers after fork | n/a | n/a | n/a | **yes** (CID-stable prepare) |
+| Operation | kind | vcluster | CubeSandbox / E2B-style | forkd | **k7d** |
+|---|---|---|---|---|---|
+| Fresh isolated Kubernetes | ~30–60 s cold | ~20 s | n/a (not a cluster) | n/a (one sandbox VM) | **warm fork of a live 3-node cluster (~105 ms CI guest / ~1.1 s Ubuntu)** |
+| Unit of fork | n/a | n/a | one microVM / process sandbox | one Firecracker VM (`MAP_PRIVATE` branch, ~56–150 ms) | **the whole cluster** (control plane + workers) |
+| Surviving TLS across fork | n/a | n/a | no (new sandbox) | — | **yes** (a held `?watch=true` stream survives) |
+| Source still answers after fork | n/a | n/a | n/a | — | **yes** (CID-stable prepare) |
+| Guest time warp | no | no | no | no | **yes** (1.83× jump at zero fidelity delta; 8× dilation) |
 
 ### What we are *not* claiming
 
 - Firecracker-beating cold boot (we boot once, then fork).
 - "&lt;5 MB per instance" density (our guests run kubelet).
 - That the virtiofs era (~2 s full-copy) was the intended steady state — it is now the explicit fallback for read-write hostPath only.
+- That dilation is free — it is a measured, bounded fidelity cost, and the jump policy exists because it has none.

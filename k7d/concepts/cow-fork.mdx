@@ -25,22 +25,30 @@ The two kernel mechanisms underneath:
 
 The only work proportional to dirty pages is the memcpy (~0.5 µs per page — ≤15 ms even at 100% dirty). Everything else is O(1). Batch forks (`tree_fork_batch`) share a single pause + dirty-bitmap capture across N forks.
 
-Disk state is copied with **filesystem reflinks** (btrfs `--reflink` / `FICLONERANGE`): a "copy" that shares all data extents copy-on-write, O(1) regardless of size.
+Disk state is copied with **filesystem reflinks** (`FICLONE` on the daemon's XFS): a "copy" that shares all data extents copy-on-write, O(1) regardless of size. Root disks, scratch disks, and named data disks all fork this way — a forked Ubuntu node's root shares ~2500 extents with its parent until it writes.
+
+### Forking from a fork: reflink keyframes
+
+The base image a child's `MAP_PRIVATE` mapping points at is its source's **keyframe**. A root's keyframe is a full dump. A child's is a reflink clone of the nearest ancestor's keyframe with only that child's dirty pages written over it — O(divergence) rather than O(guest RAM), ~0.8 s instead of ~7.8 s for an idle 3 × 2 GiB cluster. That is what makes deep trees affordable: every fork point below the root costs what the node changed, not what the guest is. Details and the measured divergence levels: [Snapshot tree — keyframes](/k7d/concepts/snapshot-tree#keyframes).
 
 ## What had to be right
 
-These are the kinds of bugs that silently break "byte-identical". The project's [CHALLENGES.md](https://github.com/katakate/k7d/blob/main/CHALLENGES.md) catalogs all of them; three headline ones:
+These are the kinds of bugs that silently break "byte-identical". The project's [CHALLENGES.md](https://github.com/katakate/k7d/blob/main/CHALLENGES.md) catalogs nearly 200 of them; four headline ones:
 
-1. **Device writes are invisible to the hypervisor's dirty log.** Block devices in k7d write guest memory from userspace. The hypervisor only sees CPU writes — so a fork taken after disk I/O would resurrect *pre-I/O* bytes on those pages (silent corruption). Fix: track device dirty pages separately, merge them into the fork bitmap, and drain in-flight I/O before the bitmap is read.
-2. **A restored guest with a blank timer chip freezes time.** After fork, the interval timer was left unprogrammed — no timer interrupts, `CLOCK_REALTIME` stuck, and Kubernetes quietly parks. Fix: re-arm the timer (and reset the paravirtual clock) on every restore.
-3. **Identical IPs only work if the L2 domains are separate.** Replay the source's addresses onto a fresh bridge per fork. Same view from inside; no conflicts across forks. See [Network identity](/k7d/concepts/network-identity).
+1. **Device writes are invisible to the hypervisor's dirty log.** Block and network devices in k7d write guest memory from userspace. The hypervisor only sees CPU writes — so a fork taken after disk I/O would resurrect *pre-I/O* bytes on those pages (silent corruption). Fix: track device dirty pages separately, merge them into the fork bitmap, and drain in-flight I/O before the bitmap is read. The same applies to the kernel's vhost-vsock DMA: its ring pages are marked by hand, or a child boots from a stale `used.idx` and its agent never answers.
+2. **A restored guest with a blank timer chip freezes time.** After fork, the interval timer was left unprogrammed — no timer interrupts, `CLOCK_REALTIME` stuck, and Kubernetes quietly parks. Fix: re-arm the timer and re-base the paravirtual clock (`KVM_SET_CLOCK`) on every restore — so a guest resumed hours later reports the right wall-clock time, not 1999, and TLS validation keeps working.
+3. **An interrupt captured mid-injection must be re-queued.** Pausing a vCPU can land between the interrupt controller ACKing a vector and the VM entry delivering it. Drop that event and the restored guest is alive but permanently deaf on that IRQ line — about 1% of warm forks, before the fix.
+4. **Identical IPs only work if the L2 domains are separate.** Replay the source's addresses onto a fresh bridge per fork. Same view from inside; no conflicts across forks. See [Network identity](/k7d/concepts/network-identity).
 
 ## After the fork: reconnecting to the guest
 
-The fork inherits the source's vsock device state, including any open agent connection — but the fork gets a fresh vsock CID. k7d injects a virtio-vsock `TRANSPORT_RESET` event into the *fork's* device state only: the guest sees its connection drop, the in-guest agent reconnects on the new CID, and the host can talk to the fresh fork. Guest clocks are reset so time does not jump backwards.
+The fork inherits the source's vsock device state, including any open agent connection — but the fork gets a fresh vsock CID. k7d injects a virtio-vsock `TRANSPORT_RESET` event into the *fork's* device state only: the guest sees its connection drop, the in-guest agent reconnects on the new CID, and the host can talk to the fresh fork. The source keeps its CID across the prepare that made it fork-ready, so `kubectl exec` against a source pod keeps working.
+
+Guest clocks are re-based so time does not jump backwards — and because k7d owns the guest clock end to end, the same pause can also move it *forward* on purpose. That is [Time warp](/k7d/guides/time-warp).
 
 ## Related pages
 
 - [Snapshot tree](/k7d/concepts/snapshot-tree) — how forks are organized, budgeted, and evicted
 - [Architecture](/k7d/concepts/architecture) — where fork sits in the stack
+- [Time warp](/k7d/guides/time-warp) — the clock the fork path already owns
 - [Benchmarks](/k7d/deep-dives/benchmarks) — the enforced numbers

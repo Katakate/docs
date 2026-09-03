@@ -138,10 +138,13 @@ sidecar: docker
 egress_whitelist:
   - "registry-1.docker.io"
   - "auth.docker.io"
-  - "production.cloudflare.docker.com"
+  - "*.docker.com"          # any-depth subdomains, not the apex
+  - "docker.com"
   - "ghcr.io"
   - "*.pkg.github.com"
 ```
+
+`*.docker.com` matches `production.cloudflare.docker.com` (and any other CDN host under that suffix) but **not** `docker.com` itself — add the apex separately. See [Networking](/k7/concepts/networking).
 
 ## Reference
 

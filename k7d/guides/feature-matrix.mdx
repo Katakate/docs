@@ -7,27 +7,40 @@ Two layers — most RL users only care about the first.
 
 ## Inside a forked cluster (your GRPO scenario)
 
-This is the k3s that lives *inside* the VMs you fork ([cluster mode](/k7d/guides/cluster-mode)). The fork engine is **N-node** (`tree_create_cluster(vm_count)` / adopt any live set) — there is no hard-coded 3. The CI fixture that proves the headline numbers is a 3-node control plane with flannel + kube-proxy and a real in-cluster Deployment; several stock k3s add-ons are still disabled there to keep that path lean. Status below mixes "API can do it" with "fixture exercises it."
+This is the k3s that lives *inside* the VMs you fork ([cluster mode](/k7d/guides/cluster-mode)). The fork engine is **N-node** (`tree_create_cluster(vm_count)` / adopt any live set) — there is no hard-coded 3.
 
-| Feature | Status | Notes |
-|---|---|---|
-| k3s control plane (server + agents) | ✅ Today | Fixture proves 3 Ready nodes; TLS / node IPs survive fork |
-| **N-node clusters** (5, 20, …) | ✅ Today | Same fork path for any `vm_count`; limited by **host RAM**, not by the API. At ~3.2 GiB/node, a 20-node base alone is ~64 GiB — shrink guest memory (or use a bigger box) and it forks like the 3-node case |
-| Flannel (`host-gw`) | ✅ Today | Shared L2 between member VMs |
-| kube-proxy (ClusterIP by IP) | ✅ Today | |
-| Deployments / ReplicaSets / Pods | ✅ Today | e.g. `inner-load` Ready on source *and* fork |
-| ConfigMaps / Secrets (as in-cluster objects) | ✅ Today | Exercised under churn before fork |
-| overlayfs snapshotter (guest containerd) | ✅ Today | |
-| CoreDNS | 🔜 Soon | Disabled in the current fixture; re-enable is next |
-| Traefik / Ingress | 🔜 Soon | Same — disabled today, queued with CoreDNS |
-| ServiceLB / metrics-server | 🔜 Soon | Disabled in the fixture |
-| `local-path` / in-cluster PVC provisioning | 🔜 Soon | Disabled (`local-storage` off) |
-| NetworkPolicy | 🔜 Later | Disabled today (`--disable-network-policy`) |
-| Cilium (eBPF CNI / policies) | 🔜 Later | Not validated inside the guest; outer host may run Cilium |
-| Longhorn / CSI drivers (iSCSI, NFS, …) | 🔜 Later | Guest kernel is minimal; no CSI path yet |
-| Nested `hostNetwork` pods | ❌ Not today | Known failure mode in the guest |
+Two guests prove the rows below. The **minimal CI guest** fixture is a 3-node control plane with flannel + kube-proxy and a real in-cluster Deployment; its default profile keeps stock k3s add-ons off so the lean path stays lean, and each add-on is an opt-in profile with its own proving test. The **[Ubuntu node](/k7d/guides/ubuntu-nodes)** runs stock Ubuntu 24.04 with k3s' own containerd and takes Cilium, Tetragon, Longhorn, and the ML operators. Every ✅ is an integration test that brings the feature up, warm-forks the cluster, and checks source and fork keep working, then diverge independently.
 
-If your scenario needs CoreDNS + Ingress tomorrow, [say so](https://github.com/katakate/k7d/issues) — re-enabling the stock add-ons is the next fidelity bump, not a redesign. Same for a larger CI fixture: wiring 20 nodes is configuration + RAM, not a new fork feature.
+| Feature | Status | Proven on | Notes |
+|---|---|---|---|
+| k3s control plane (server + agents) | ✅ Today | both | 3 Ready nodes; TLS / node IPs survive fork |
+| **N-node clusters** (5, 20, …) | ✅ Today | — | Same fork path for any `vm_count`; limited by **host RAM**, not the API. Ubuntu nodes cost ~1.1–1.4 GiB each; the CI fixture ~3.2 GiB. Shrink guest memory or use a bigger box and a 20-node cluster forks like the 3-node case |
+| Flannel (`host-gw`) | ✅ Today | both | Shared L2 between member VMs |
+| kube-proxy (ClusterIP by IP) | ✅ Today | both | |
+| Deployments / ReplicaSets / Pods | ✅ Today | both | e.g. `inner-load` Ready on source *and* fork |
+| ConfigMaps / Secrets | ✅ Today | both | Exercised under churn before fork |
+| overlayfs snapshotter (guest containerd) | ✅ Today | both | |
+| CoreDNS | ✅ Today | CI guest | DNS answers on all members across a warm fork |
+| Traefik / Ingress | ✅ Today | CI guest | HTTP through an Ingress on source and fork |
+| ServiceLB | ✅ Today | CI guest | Traefik Service reports guest IPs as LB ingress |
+| metrics-server | ✅ Today | CI guest | `kubectl top` / `metrics.k8s.io` Available on all three nodes across a fork |
+| `local-path` / in-cluster PVC provisioning | ✅ Today | CI guest | Same bytes on source and fork, then independent divergence |
+| NetworkPolicy | ✅ Today | CI guest | Default-deny + allow enforced on source and fork (guest kernel carries ipset + `xt_set`, NFLOG/limit, `nft_log`/`nft_limit`) |
+| HPA | ✅ Today | CI guest | CPU-metrics scale-up on source and fork; utilization diverges after a fork-only load change |
+| Embedded etcd datastore | ✅ Today | CI guest | Single-member `--cluster-init` WAL and writes survive a fork; per-bridge writes stay isolated |
+| ArgoCD core GitOps | ✅ Today | CI guest | In-cluster `git://`; Application Synced/Healthy on both bridges; a fork-only commit syncs only on the fork |
+| **Cilium** (eBPF CNI, kube-proxy replacement, CiliumNetworkPolicy) | ✅ Today | both | Native routing on the CI guest; Helm Cilium 1.16.10 on Ubuntu (`k7d.cni=none`) |
+| **Tetragon** 1.7.0 | ✅ Today | Ubuntu | Fork-and-diff of the event stream: inject on a child, the source's stream stays clean |
+| **Longhorn** 1.12.1 (RWO / RWX CSI) | ✅ Today | Ubuntu | RWO + RWX PVCs and their markers survive a fork as reflink-CoW named data disks. Needs 4 vCPU / 4 GiB nodes |
+| Mock GPU + DCGM fixture | ✅ Today | Ubuntu | `nvidia.com/gpu` from a real kubelet device plugin; a pod requesting one GPU becomes Running and free GPUs drop; a dcgm-exporter-shaped scrape survives a fork. **Mock only — not CUDA** |
+| JobSet v0.12.0 on mock GPUs | ✅ Today | Ubuntu | 2-worker JobSet rendezvous over cluster DNS and Completes; in-flight + Complete survive a fork. **Not CUDA / not DeepSpeed** |
+| Kubeflow Trainer v2.2.1 (TrainJob) on mock GPUs | ✅ Today | Ubuntu | 2-worker TrainJob stays Running across a fork; a child-only TrainJob stays invisible on the source. **Not a PyTorch runtime** |
+| Kueue v0.19.2 on mock GPUs | ✅ Today | Ubuntu | A ClusterQueue with GPU quota 1 admits one Job and holds the second Pending; the split survives a fork. **Not a batch-scheduler claim** |
+| KubeRay v1.7.0 on mock GPUs | ✅ Today | Ubuntu | CPU head + GPU worker schedule on the mock and survive a fork. **Not CUDA** |
+| Soft-RoCE (`rdma_rxe`) | ✅ Today | Ubuntu | `rxe0` on guest `eth0`; `rdma link` + `ibv_devinfo` on ≥2 nodes survive a fork; a child-only `rxe1` stays invisible on the source. **Not NCCL / not GPUDirect** |
+| Nested `hostNetwork` pods | ❌ Not today | — | Known failure mode in the guest |
+
+Need CoreDNS + Ingress on one CI-guest cluster? Flip the profile flags — the switchboard is configuration, not a redesign. Same for a larger fixture: wiring 20 nodes is configuration + RAM, not a new fork feature. Per-row fork latencies: [Benchmarks](/k7d/deep-dives/benchmarks).
 
 ## Host RuntimeClass (pods *as* k7d VMs)
 
@@ -40,9 +53,11 @@ This is the outer layer: kubectl on the host schedules pods into k7d microVMs vi
 | Pod IP, Services, DNS, egress | ✅ Today | Host CNI dataplane |
 | ConfigMap / Secret / projected / downwardAPI / emptyDir | ✅ Today | |
 | hostPath, local-path PVC, k7d RWO disk volumes | ✅ Today | |
+| Writable scratch on a host disk; per-container scratch; named persistent data disks | ✅ Today | `k7d.katakate.org/scratch-size`, `container-scratch-size`, `data-disks` annotations |
 | Memory / CPU limits; multi-container / sidecars | ✅ Today | |
 | Warm VM + whole-cluster fork / snapshot tree | ✅ Today | The point of the project |
-| Init containers; natural exit / `restartPolicy` | ✅ Today | |
+| Init containers; natural exit / `restartPolicy` | ✅ Today | Multi-container pods |
 | Multi-vCPU guests (`cpu: "2"+`) | ✅ Today | vCPU count derived from the pod's CPU limit; fork/snapshot parity |
-| `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | |
+| Pause / resume a pod's VM | ✅ Today | `pause_vm` / `resume_vm`; CID and memory retained |
+| `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | Host RuntimeClass only — in-cluster Cilium NetworkPolicy and Longhorn RWX are the rows above |
 | Cross-node fork | 🔮 Later | Host-local trees today |

@@ -1,0 +1,114 @@
+---
+title: "Time warp"
+description: "Only waiting is compressible: lockstep guest-clock jumps, auto-warp, and continuous ×N KVM time dilation"
+---
+
+Fork removes the cost of *starting* an episode. Most of what is left in a Kubernetes episode is waiting — readiness probes, `CrashLoopBackOff` timers, controller reconcile ticks. A 3-node Ubuntu cluster is all-idle ~70% of the time and only 7–10% of its vCPUs are awake.
+
+k7d already owns the guest clock end to end (`kvm-clock`, no RTC, no NTP client, `KVM_SET_CLOCK` on every restore), so the same pause that makes a fork correct can also move every member's clock by the same delta. Two mechanisms, one rule: **forward only, lockstep only, whole-cluster pause or nothing** — a declined warp is always correct.
+
+## The numbers
+
+An 8.7-minute guest-time episode on a 3-node Ubuntu k3s cluster:
+
+| Mechanism | What it does | Wall time | Fidelity cost |
+|---|---|---|---|
+| **Stock clock** | — | **522 s** | — |
+| **Lockstep jump** (`auto_warp` `jump`, no kernel patch) | When every vCPU is idle, pause, add the same δ to kvmclock + every TSC offset up to the next armed timer, resume. ~0.2 ms pause, ~20 Hz | **286 s (1.83×)** | **zero** — same probe failures, restarts, leases, splats as stock |
+| **Continuous dilation ×N** (carried ~200-line KVM patch) | Guest clocks run N× wall; every clock the guest can read agrees. Set per VM, changed live on a paused cluster in ~0.4 ms, inherited or overridden on fork | **79 s (8.00×)** at N=8; exactly N through 16, knee at N=12 | real, bounded: work does not dilate, so guest-visible `fsync` 2.3 → 14 ms, pod RTT 0.69 → 0.92 ms, a guest-paced churn loop does 37 rounds instead of 86 |
+| Both | — | 76 s (8.11×) | the two do not stack: dilation consumes the idle windows jumps need |
+
+## Lockstep jumps — `warp_clock` and `auto_warp`
+
+`warp_clock` moves every live VM on one cluster bridge forward by `delta_ms`:
+
+```json
+{"op": "warp_clock", "cluster_id": "t1", "delta_ms": 90000}
+{"status": "warped", "cluster_id": "t1", "vm_ids": ["…"], "delta_ms": 90000, "latency_ns": 412000}
+```
+
+The whole cluster is paused for the write and resumed after it. A uniform jump is what etcd heartbeats, lease TTLs, and TLS skew checks tolerate; a skewed one is not. A warp that fails on one member rolls that member back and errors — all or none.
+
+Instead of telling the daemon "+90 s", let it find the idle time itself:
+
+```json
+{"op": "auto_warp", "cluster_id": "t1", "mode": "jump"}
+…
+{"op": "auto_warp", "cluster_id": "t1", "mode": "off"}
+{"status": "auto_warp", "mode": "off", "holders": [], "stats": {"cycles": 10412, "warps": 9871, "guest_ns_added": 236000000000, "wall_ns_paused": 2100000000, …}}
+```
+
+| Mode | Behaviour |
+|---|---|
+| `jump` | Probe the cluster; when every vCPU is provably idle, jump to just before the earliest armed timer. Zero fidelity cost — timers fire exactly when they would have |
+| `micro` | Warp by a fixed 50 ms quantum every quantum regardless of idleness. Fidelity cost: a timer can fire late by at most one quantum |
+| `off` | Stop the loop. The reply carries the finished run's counters |
+
+Every reason a cycle declines to warp is a *correct* outcome; declining costs a sample, guessing costs correctness.
+
+<Warning>
+**Caller contract: no guest action may be in flight during a warp.** Daemon ops run under the VM registry lock the policy loop also takes, so they cannot overlap a jump. A client driving a member from *outside* the daemon — an agent `exec` straight over vsock — is invisible to that lock and must take a hold first:
+
+```json
+{"op": "auto_warp_hold", "cluster_id": "t1", "holder": "harness-42", "hold": true}
+… exec over vsock …
+{"op": "auto_warp_hold", "cluster_id": "t1", "holder": "harness-42", "hold": false}
+```
+
+Otherwise that guest sees its clock jump mid-syscall. Releasing a hold nobody took is an error, not a no-op.
+</Warning>
+
+## Continuous dilation — `dilation` and `set_dilation`
+
+Dilation makes every clock the guest can read run N× faster than wall time, for the whole life of the VM. It needs a small carried KVM patch on the host (per-VM continuous time dilation). The patch and the install/revert loop ship in the repo at [`utils/kvm-dilation/`](https://github.com/katakate/k7d/tree/main/utils/kvm-dilation):
+
+```bash
+make dilation-install    # on the KVM host: build modules for `uname -r`, swap them in
+make dilation-revert     # stock kvm.ko / kvm_amd (or kvm_intel) back
+# from a machine without KVM:
+make remote-dilation-install
+make remote-dilation-revert
+```
+
+`install.sh` stops `k7d`, refuses the swap if another VM still holds `/dev/kvm`, and puts stock modules back if the patched pair fails to load. Ubuntu x86, root, and the running kernel's `linux-source` / headers (pulled from Launchpad). A host without the patch fails VM creation for `dilation > 1` instead of silently running at 1×. Lockstep jumps need no patch.
+
+Set it at creation — every member of a cluster is created from one `VmConfig`, so a cluster is dilated in lockstep by construction:
+
+```json
+{"op": "tree_create_cluster", "vm_count": 3, "config": {"memory_mb": 2048, "vcpus": 2, "dilation": 8, "…": "…"}}
+```
+
+Change it live on a running cluster (the cluster is paused for the write; the kernel refuses the change while any vCPU is runnable):
+
+```json
+{"op": "set_dilation", "cluster_id": "t1", "factor": 4}
+{"status": "dilation_set", "cluster_id": "t1", "vm_ids": ["t1#0", "t1#1", "t1#2"], "factor": 4, "latency_ns": 380000}
+```
+
+Lowering the factor is **not a rewind** — the guests keep every nanosecond they have already been given; they only stop accumulating them so fast. Raising is the same write in the other direction.
+
+### Forks and dilation
+
+A fork lands on the source's clock and inherits the source's factor unless told otherwise:
+
+```json
+{"op": "tree_fork_batch", "tree_id": "t1", "source_id": "root", "labels": ["a", "b"], "dilation": 8}
+```
+
+So one ×1 source tree serves every mode: fork some children at ×8 for cheap exploration and keep others at ×1 for a faithful control. `tree_nodes` reports each live node's factor in `live_dilation`; fork responses carry `dilation`.
+
+### Why N=8 and not 16
+
+Compression is exactly N through 16 — but the fidelity cost is a curve, not a cliff. Extra liveness-probe failures across N ∈ {1, 2, 4, 8, 12, 16} went 0 / 0 / 0 / 3 / 19 / 32, and in-guest churn rounds collapsed 110 → 7. The host-side reading that moved *with* the damage is busy-phase **mean awake vCPUs**: at 6 of 6 there is no idle left to sell. That is the signal an adaptive policy should watch — not probe failures, which arrive through the guest's API server, the exact thing dilation is starving.
+
+## What is and is not compressible
+
+- **Compressible:** guest-side waiting — timers, backoffs, probe periods, lease TTLs, reconcile intervals.
+- **Not compressible:** compute. A dilated guest still takes the same wall time to `fsync` or serve a request, so from the guest's point of view those operations look N× slower. That is the fidelity cost above, and it is why the honest default is a jump policy at zero cost, with dilation opt-in per tree.
+- **Not touched:** the source's clock when you fork. Warp and dilation apply to the cluster you name; siblings on other bridges are unaffected.
+
+## Related pages
+
+- [Daemon API — clock operations](/k7d/api/protocol#clock-operations)
+- [Cluster mode](/k7d/guides/cluster-mode) — the cluster these ops act on
+- [Benchmarks](/k7d/deep-dives/benchmarks) — enforced budget for the lockstep warp

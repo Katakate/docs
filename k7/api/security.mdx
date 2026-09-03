@@ -172,7 +172,7 @@ Whitelist specific external services (avoid public DNS resolvers):
 </Info>
 
 <Warning>
-Do not whitelist public DNS resolver IPs (e.g., 1.1.1.1, 8.8.8.8). Because K7's `egress_whitelist` is CIDR-only (no L7/port rules), allowing those IPs enables outbound DNS (UDP/TCP 53) and DNS-over-HTTPS (443), which can be used for exfiltration. If you want an egress deny with whitelisting, prefer whitelisting only your own egress proxy/gateway IP and enforce DNS/DoH policy at that proxy. Later, whenever we integrate Cilium (a roadmap feature), it will be much simpler as you'll be able to whitelist domain names directly.
+Do not whitelist public DNS resolver IPs (e.g., 1.1.1.1, 8.8.8.8). A CIDR allowlist has no L7/port filter, so those IPs re-enable outbound DNS (UDP/TCP 53) and DNS-over-HTTPS (443) and can be used for exfiltration. Prefer your own egress proxy IP, or use **FQDN allowlists**. Cilium is the default CNI, so `egress_whitelist: ["api.openai.com", "*.huggingface.co"]` works without extra setup. See [Networking](/k7/concepts/networking).
 </Warning>
 
 ### Mitigations when DNS is blocked
@@ -180,5 +180,17 @@ Do not whitelist public DNS resolver IPs (e.g., 1.1.1.1, 8.8.8.8). Because K7's 
 - Use IP/CIDR whitelisting only (no domains post-lockdown)
 - Pre-resolve/fetch in `before_script` (runs before lockdown with open egress)
 - If you must allow DNS temporarily, consider an operational override at cluster level (not provided by K7 config)
+
+## API key namespace scope
+
+`k7 generate-api-key NAME -n team-a` stores an optional `namespaces` list on the key. The API enforces it on every namespace-bearing endpoint:
+
+- Listed namespaces only — another namespace returns `403 Forbidden`.
+- All-namespaces list / GC (`namespace` omitted or `all_namespaces=true`) is denied for scoped keys.
+- Keys without a scope keep full cross-namespace access.
+
+## Image registry allowlist (SSRF)
+
+When the control plane inspects a sandbox `image` (entrypoint/cmd resolution), the registry host is resolved **before** any fetch. Hosts must be on the allowlist (`registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`, plus `K7_REGISTRY_ALLOWLIST`) and every A/AAAA must be a public unicast address. Loopback, private, link-local, metadata, and reserved ranges are rejected. Redirects are not followed.
 
 

@@ -16,8 +16,10 @@ Destructive operation. This irreversibly erases all partitions, RAID metadata, f
 ### Usage
 
 ```bash
-sudo ./utils/wipe-disk.sh /dev/nvme2n1
+sudo ./utils/wipe-disk.sh /dev/nvme1n1
 ```
+
+On dual-NVMe Hetzner boxes, wipe **only the spare** disk (the one that is not the OS root). After `k7 install`, leave `k7_devmapper_disk` / `--disk` unset so the playbook auto-detects that spare — NVMe names (`nvme0n1` vs `nvme1n1`) swap across reboots. See [Hetzner node setup](https://github.com/Katakate/k7/blob/main/tutorials/k7_hetzner_node_setup.md).
 
 You will be prompted to type `YES` to proceed. The script will:
 

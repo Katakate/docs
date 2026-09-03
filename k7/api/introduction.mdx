@@ -15,7 +15,7 @@ X-API-Key: <your-key>
 Authorization: Bearer <your-key>
 ```
 
-All endpoints return standard HTTP codes. `401 Unauthorized` if the key is missing/invalid/expired.
+All endpoints return standard HTTP codes. `401 Unauthorized` if the key is missing/invalid/expired. `403 Forbidden` if a **namespace-scoped** key is used against another namespace or an all-namespaces operation. Keys created with `k7 generate-api-key NAME -n <ns>` are scoped; omit `-n` for unrestricted access.
 
 ## Response envelope
 
@@ -35,6 +35,7 @@ Common error codes:
 
 - `BadRequest` (400): Invalid input or missing parameters
 - `Unauthorized` (401): Missing or invalid API key
+- `Forbidden` (403): Namespace-scoped key used outside its allowlist
 - `NotFound` (404): Resource was not found
 - `Conflict` (409): Resource already exists
 - `UnprocessableEntity` (422): Validation failed

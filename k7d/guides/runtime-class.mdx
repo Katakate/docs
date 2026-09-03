@@ -15,7 +15,11 @@ The release [installer](/k7d/getting-started/installation) does all four steps f
 The shim is a thin client: sandbox `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly if it is not running.
 
 ```bash
-cp dist/k7d /usr/local/bin/
+cd dist/k7d-v0.4.0-x86_64-linux     # or the extracted release tarball
+cp k7d /usr/local/bin/
+mkdir -p /usr/local/share/k7d /opt/k7d
+cp vmlinux initramfs.cpio.gz /usr/local/share/k7d/
+cp runc.amd64 /opt/k7d/              # the shim's static runc for the guest
 cat > /etc/systemd/system/k7d.service <<'EOF'
 [Unit]
 Description=k7d VM runtime daemon
@@ -23,6 +27,9 @@ Description=k7d VM runtime daemon
 [Service]
 ExecStart=/usr/local/bin/k7d
 Environment=RUST_LOG=info
+Environment=K7D_KERNEL=/usr/local/share/k7d/vmlinux
+Environment=K7D_INITRD=/usr/local/share/k7d/initramfs.cpio.gz
+LimitNOFILE=524288
 
 [Install]
 WantedBy=multi-user.target
@@ -30,11 +37,13 @@ EOF
 systemctl enable --now k7d
 ```
 
+The guest pair is required: the daemon is the *only* process that decides which guest a VM boots, and without `K7D_KERNEL` / `K7D_INITRD` it refuses to create a VM rather than guessing. `LimitNOFILE` matters as soon as you fork clusters — the 1024 soft default runs out fast.
+
 </Step>
 <Step title="Install the shim binary">
 
 ```bash
-cp dist/containerd-shim-k7-v1 /usr/local/bin/
+cp containerd-shim-k7-v1 /usr/local/bin/
 ```
 
 containerd resolves the binary from the runtime type automatically (`io.containerd.k7.v1` → `containerd-shim-k7-v1`).
@@ -126,6 +135,33 @@ Per-container scratch is opt-in for two reasons: each image spends one of the VM
 
 Kubernetes itself cannot see any of this: the CRI carries no ephemeral-storage figure in either direction, so `resources.limits.ephemeral-storage` never reaches the runtime and these annotations are the only sizing input. Usage is measured inside the guest and surfaced in the shim log, not in `kubectl top`.
 
+### Persistent data disks
+
+Scratch dies with the pod. For state that must outlive the VM — a storage node's replica directory, a database's data dir — ask for **named** disks:
+
+```yaml
+metadata:
+  annotations:
+    k7d.katakate.org/data-disks: longhorn:8Gi:/var/lib/longhorn,pg:20Gi:/var/lib/postgresql
+```
+
+Each `id:size:guest-mount` entry attaches an ext4 image `data/<id>.img` on the daemon's reflink filesystem, created and formatted on first use and reused as-is on every later attach. Sandbox teardown leaves it in place; only the daemon's `delete_data_disk` op removes it. A size that disagrees with an existing image is an error, not a resize. A warm fork gets a reflink-CoW copy, so a fork's writes diverge from the source's without a byte copy. Like per-container scratch, every disk spends one virtio-blk device slot, which is why it is opt-in.
+
+## Annotation reference
+
+| Annotation | Value | Meaning |
+|---|---|---|
+| `k7d.katakate.org/scratch-size` | quantity (`8Gi`) | Pod-wide writable scratch disk. Default 8 GiB |
+| `k7d.katakate.org/container-scratch-size` | `name=size,…` | Own writable image per named container |
+| `k7d.katakate.org/data-disks` | `id:size:mount,…` | Named persistent disks |
+| `k7d.katakate.org/image-slots` / `image-slot-size` | count / quantity | Spare virtio-blk slots (default 4 × 2 GiB, sparse) for images assigned after boot — later containers of the pod mount their rootfs without a VM restart |
+| `k7d.katakate.org/cluster-id` | string | Put this pod's VM on the shared bridge `k7-br-<id>` with a stable `10.200.0.{2+index}` identity — the [cluster mode](/k7d/guides/cluster-mode) adopt path |
+| `k7d.katakate.org/fork-source-cluster` / `fork-source-vm` / `fork-vm-index` | strings | Boot this pod as a warm **fork** of a live sandbox VM instead of cold-booting: the fork adopts the container already running inside the forked guest. The source keeps its vsock CID |
+
+All values fail loud on a malformed entry — a pod that asked for a disk and silently did not get one would lose its data with the VM, which is the failure the annotations exist to prevent.
+
 ## Because VMs outlive shims
 
 The daemon owns the VMs, so a containerd restart or shim crash does not kill your workloads: a freshly respawned shim resolves its sandbox back to the still-running VM via the daemon's `reattach_sandbox` operation, which also verifies the guest agent still answers before handing the VM back.
+
+The daemon also exposes `pause_vm` / `resume_vm` for a sandbox VM: vCPU threads are stopped and device workers parked while guest memory, devices, and the vsock CID stay put. This is what K7's `k7 pause` uses against the k7d backend.

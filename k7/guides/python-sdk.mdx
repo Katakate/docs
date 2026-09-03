@@ -75,7 +75,7 @@ sb = k7.create({
     "namespace": "default",
 
     # Backend selection
-    "backend": "kata-qemu-longhorn",      # or "kata-firecracker-devmapper"
+    "backend": "kata-qemu-longhorn",      # or "kata-firecracker-devmapper" / "k7d"
     "root_disk_size": "20Gi",        # kata-qemu-longhorn only
 
     # Sidecar (Docker-in-VM)
@@ -256,6 +256,6 @@ except requests.HTTPError as e:
 
 ## Tips
 
-- Always pass `namespace=` if you use anything other than `default`.
+- Always pass `namespace=` if you use anything other than `default`. A **namespace-scoped** API key (`k7 generate-api-key NAME -n team-a`) cannot list all namespaces or touch another namespace (`403`).
 - Rotate API keys with `k7 revoke-api-key <name>` and `k7 generate-api-key <name>`.
 - The same operations are available via CLI (`k7 pause`, `k7 fork`, `k7 snapshot`, `k7 restore`) — default CLI path is the HTTP API; use `--core` only on the cluster node.

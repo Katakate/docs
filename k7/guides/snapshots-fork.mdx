@@ -76,20 +76,17 @@ Fork takes a snapshot of the source sandbox's PVC, **clones it into a new PVC**,
 
 ## Observed performance
 
-Measured on a single Hetzner dedicated node (3× NVMe, Ubuntu 24.04, Longhorn `replicas=1`) — see [PERFORMANCE.md](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md):
+Single-node medians (Hetzner AX41, Longhorn `replicas=1`, 2026-08-10) — see [PERFORMANCE.md](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md):
 
-| Operation | Latency | Soft limit |
-|-----------|---------|------------|
-| Cold create → pod ready | **15.2 s** | — |
-| Snapshot ready | 7.0 s | < 60 s |
-| Pause (scale to 0) | 0.13 s | — |
-| Resume (scale to 1 + ready) | 4.5 s | < 60 s |
-| **Fork (total)** | **44.9 s** | < 120 s |
-| — snapshot | 3.0 s | |
-| — clone PVC bound | 2.7 s | |
-| — deployment ready | 39.2 s | |
+| Operation | kql | k7d |
+|-----------|-----|-----|
+| Cold create → pod ready | **17.1 s** | **2.1 s** |
+| Named snapshot ready | 6.5 s | n/a (k7d rejects `k7 snapshot`) |
+| Pause | 1.3 s (scale to 0) | **0.2 s** (VM frozen in place) |
+| Resume → exec | 4.1 s | **0.3 s** |
+| **Fork → usable** | **46.7 s** (disk clone + cold boot) | **2.4 s** (warm memory CoW) |
 
-Fork is roughly 3× slower than a cold create today — most of the time is the cloned PVC's first attach (Longhorn replays cloned data).
+On a two-node r=2 cluster (2026-08-18 Show HN cut) kql fork is ~83 s; k7d fork stays ~4 s and is the only backend whose fork inherits live memory (`/tmp` markers, running processes).
 
 ## Example: a parallel exploration with fork
 

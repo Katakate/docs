@@ -61,12 +61,16 @@ Body example with egress whitelist (safe pattern: proxy IP only):
 Fields accepted in the JSON body when creating a sandbox:
 
 - `name` (string, required): Unique sandbox name in the namespace
-- `image` (string, required): Container image, e.g. `alpine:latest`
+- `image` (string, required): Container image, e.g. `alpine:latest`. Registry host must be public and allowlisted (`registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`; extend with `K7_REGISTRY_ALLOWLIST`)
+- `backend` (string | null): `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), or `k7d`. Auto-detected when omitted
+- `sidecar` (string | null): Sidecar type, e.g. `docker`
+- `root_disk_size` (string, default `10Gi`): Longhorn root PVC size (`kql` only)
 - `namespace` (string, default `default`): Kubernetes namespace
 - `env_file` (string | null): Path (on API host) to `.env` file to inject as Secret
 - `before_script` (string, default empty): Shell commands to run before the container is marked Ready
+- `entrypoint` / `cmd` (string[] | null): Override image ENTRYPOINT / CMD
 - `limits` (object): Resource limits/requests; keys supported: `cpu`, `memory`, `ephemeral-storage`
-- `egress_whitelist` (string[] | [] | null): See Egress section below
+- `egress_whitelist` (string[] | [] | null): omit / `null` = open; `[]` = block-all; listed CIDRs or FQDNs = allowlist. See [Networking](/k7/concepts/networking)
 - `pod_non_root` (boolean, default false): Run pod as non-root (UID/GID/FSGroup 65532)
 - `container_non_root` (boolean, default false): Run container as non-root (UID 65532)
 - `cap_drop` (string[] | null): List of capabilities to drop; default policy is `ALL`
@@ -95,7 +99,7 @@ curl -H "X-API-Key: $K7_API_KEY" "$BASE/api/v1/sandboxes?namespace=default"
 ```
 </RequestExample>
 
-Returns list of sandbox objects with fields: name, namespace, status, ready, restarts, age, image, error_message.
+Returns list of sandbox objects with fields: name, namespace, status, ready, restarts, age, image, backend, node, error_message.
 
 <ResponseExample>
 ```json Success
@@ -230,9 +234,9 @@ Responses:
 
 Endpoint: `POST /api/v1/sandboxes/{name}/pause`
 
-Scales the sandbox Deployment to 0 and optionally creates a Longhorn
-`VolumeSnapshot` of its root PVC for crash-consistent state capture
-(kata-qemu-longhorn only).
+On **kql**, scales the sandbox Deployment to 0 and optionally creates a Longhorn
+`VolumeSnapshot` of its root PVC. On **k7d**, freezes the live VM in place
+(memory survives). `--snapshot` / the `snapshot` body field is kata-qemu-longhorn-only.
 
 <ParamField path="name" type="string" required>Sandbox name</ParamField>
 
@@ -269,7 +273,7 @@ curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
 
 Endpoint: `POST /api/v1/sandboxes/{name}/resume`
 
-Scales the Deployment back to 1.
+On **kql**, scales the Deployment back to 1 (PVC re-attaches). On **k7d**, restarts the vCPU loop — in-memory state survives.
 
 <ParamField path="name" type="string" required>Sandbox name</ParamField>
 
@@ -296,10 +300,11 @@ curl -X POST -H "X-API-Key: $K7_API_KEY" -H "Content-Type: application/json" \
 
 Endpoint: `POST /api/v1/sandboxes/{name}/fork`
 
-Clones a kata-qemu-longhorn sandbox into a new name with its own disk derived
-from a fresh `VolumeSnapshot` of the source's root PVC. The request blocks
-until the new PVC is bound (typically ~45 s today). Fork is kata-qemu-longhorn
-only — fork on a `kata-firecracker-devmapper` sandbox returns 400.
+Clones a sandbox into a new name. **kql**: disk-only clone from a
+`VolumeSnapshot` of the source's root PVC (~45 s single-node; longer with
+replicas ≥ 2). **k7d**: warm CoW fork of disk **and** memory (~2–4 s to a
+Ready pod; child inherits running processes). **kfd**: returns 400. The
+request blocks until the new sandbox is usable.
 
 <ParamField path="name" type="string" required>Source sandbox name</ParamField>
 

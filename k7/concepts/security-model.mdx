@@ -64,6 +64,7 @@ Every sandbox is a Kata Containers pod, which means **a real VM with its own ker
 
 - **`kata-firecracker-devmapper`** uses Firecracker — ~50k LoC Rust microVMM, ~5MB resident, ~125ms boot. The Firecracker process runs **inside the jailer**: a chroot jail with an empty filesystem, dropped capabilities, a restrictive seccomp filter, and an unprivileged UID. An integration test (`tests/integration/test_firecracker.py::test_jailer_active`) verifies the jailer is active on every install.
 - **`kata-qemu-longhorn`** uses QEMU — bigger surface than Firecracker but still hardware-isolated, and Kata applies its own sandboxing primitives.
+- **`k7d`** uses Katakate's own KVM VMM (`runtimeClassName: k7`). CoW sibling-fork isolation differs — see the [k7d security model](/k7d/concepts/security).
 
 ## Container hardening
 
@@ -93,8 +94,12 @@ Some package managers (`apk add`, `apt-get install`) require root inside the con
 - Stored in `/etc/k7/api_keys.json` (mode 0600) as **SHA-256 hashes** — the plaintext key is never written to disk.
 - Comparison uses `secrets.compare_digest` (constant-time, timing-attack resistant).
 - Optional **expiry**; expired keys are purged opportunistically on every authenticated request.
+- Optional **namespace scope**: `k7 generate-api-key NAME -n <ns>` (repeatable). Enforced on every namespace-bearing endpoint — a scoped key cannot touch another namespace or run all-namespaces operations (`403 Forbidden`). Keys without a scope stay unrestricted (backward compatible).
 - `last_used` timestamp recorded for audit.
 - Authenticate via `X-API-Key: <key>` or `Authorization: Bearer <key>`.
+- **Registry SSRF guard** (0.2.1+): control-plane OCI inspection rejects registry hosts that are not on the allowlist (default `registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`; extend with `K7_REGISTRY_ALLOWLIST`) or that resolve to loopback / private / link-local / reserved addresses. Redirects are disabled; the old `localhost` → HTTP downgrade is gone.
+
+Upgrade to **0.2.1 or later** if you run the `k7-api` control plane. 0.2.0 and earlier are unsupported.
 
 The API runs as a K3s Deployment with its own ServiceAccount and a scoped ClusterRole — no admin kubeconfig is ever mounted.
 
@@ -102,7 +107,7 @@ The API runs as a K3s Deployment with its own ServiceAccount and a scoped Cluste
 
 1. **Always lock down egress** for untrusted workloads. Prefer FQDN allowlists (Cilium) — much less error-prone than tracking CIDR ranges that change.
 2. **Don't whitelist public DNS resolvers** (`1.1.1.1`, `8.8.8.8`) — that re-enables DNS exfiltration.
-3. **Rotate API keys** with `k7 revoke-api-key` + `k7 generate-api-key`. Treat them as credentials.
+3. **Rotate API keys** with `k7 revoke-api-key` + `k7 generate-api-key`. Treat them as credentials. Scope production keys with `-n` so a leaked key cannot list every namespace.
 4. **Set a TLS reverse proxy** in front of the NodePort if you expose the API publicly (the NodePort itself is plain HTTP).
 5. **Pin image tags** — `:latest` is convenient but non-reproducible. K7 itself pins every image and Kubernetes manifest version it ships; do the same in your sandbox configs.
 

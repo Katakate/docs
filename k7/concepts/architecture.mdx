@@ -72,11 +72,11 @@ flowchart TB
 
 ### CLI — `k7`
 
-A Typer-based CLI distributed as a Debian package (`apt install k7`). It wraps `K7Core` directly for node-local operations (`install`, `create`, `shell`, `top`) and shells out to `kubectl` only where unavoidable (e.g. interactive `kubectl exec` for `k7 shell`).
+A Typer-based CLI distributed as a Debian package (`apt install k7`). Sandbox-management commands (`create`, `list`, `fork`, …) talk to the **K7 API** by default. Node-local commands (`install`, `generate-api-key`, `shell`, `top`) still run on the cluster. Hidden `--core` bypasses the API and calls `K7Core` in-process. Interactive `k7 shell` shells out to `kubectl exec`.
 
 ### API — `k7-api`
 
-A FastAPI service that exposes a REST surface for sandbox lifecycle and exec. The API runs as a **K3s `Deployment`** in `kube-system` with a `NodePort` Service, an in-cluster `ServiceAccount`, and a scoped `ClusterRole`. Stop it with `k7 stop-api` (scale to 0) or `k7 stop-api --delete` (full teardown).
+A FastAPI service that exposes a REST surface for sandbox lifecycle and exec. The API runs as a **K3s `Deployment`** in `kube-system` with a `NodePort` Service, an in-cluster `ServiceAccount`, and a scoped `ClusterRole`. Temporarily stop it with `k7 api disable` (scale to 0) and bring it back with `k7 api enable`.
 
 The entire `K7Core` is async (`kubernetes_asyncio` + `httpx`), so the API can serve concurrent requests without thread-pool workarounds.
 
@@ -127,7 +127,7 @@ A raw disk is provisioned as an LVM thin-pool. Containerd's devmapper snapshotte
 
 ## Request lifecycle: `k7 create`
 
-1. **Client → API**: `POST /api/v1/sandboxes` with a `SandboxConfig` JSON body. The API validates the API key (SHA-256 hashed, timing-safe compare) and forwards to `K7Core.create_sandbox`.
+1. **Client → API**: `POST /api/v1/sandboxes` with a `SandboxConfig` JSON body. The API validates the API key (SHA-256 hashed, timing-safe compare), enforces optional per-key namespace scope, checks the image registry host against the public allowlist (SSRF guard), and forwards to `K7Core.create_sandbox`.
 2. **K7Core**: builds a Kubernetes `Deployment` (1 replica), an optional `Secret` from `env_file`, an optional `PVC` (`<name>-root-lh`) on `kata-qemu-longhorn`, an ingress-deny `NetworkPolicy`, and either a CIDR `NetworkPolicy` or a `CiliumNetworkPolicy` for egress.
 3. **K3s scheduler** picks a node based on `nodeSelector` (`k7.katakate.org/backend-<backend>=true`, set by the installer per host).
 4. **Kata** (via the appropriate containerd shim) launches a VM, mounts the rootfs (devmapper or Longhorn PVC), and starts the user container inside it.

@@ -11,11 +11,12 @@ If you already installed k7 previously, consider running `make uninstall` before
 
 ## Requirements
 
-- Linux (amd64) host with hardware virtualization (KVM)
+- Ubuntu host with hardware virtualization (KVM)
   - Check: `ls /dev/kvm` should exist
-  - Cloud guidance: AWS `.metal`, GCP (enable nested virtualization), Azure D/Ev series; typical VPS often lack KVM
-- One raw, unformatted disk for thin‑pool provisioning (recommended for many sandboxes)
-- Docker with Compose plugin (for the API)
+  - **`kfd` and `kql`**: amd64 or arm64. **`k7d` is amd64 / x86_64 only.**
+  - Cloud guidance: AWS `.metal`, GCP (enable nested virtualization), Azure D/Ev series; typical VPS often lack KVM. Hetzner: Robot dedicated only (not Cloud VPS).
+- For the `kfd` (Firecracker) backend: one raw, unformatted disk for the LVM thin-pool. `kql` and `k7d` do not need a spare disk.
+- Docker (the install playbook builds the `k7-api:local` image on the node). Compose is **not** required to run the API — it is a K3s Deployment.
   - Install Docker: `curl -fsSL https://get.docker.com | sh`
 - Ansible for the installer (Ubuntu):
 
@@ -28,7 +29,7 @@ sudo apt install -y ansible
 - Python 3.10+ on the client for the SDK
 
 <Info>
-Tested setup example: Hetzner Robot instance, Ubuntu 24.04 (x86_64), with an extra empty NVMe disk (for the thin‑pool). See the detailed setup guide (PDF): <a href="/tutorials/k7_hetzner_node_setup.pdf" target="_blank" rel="noopener noreferrer">k7_hetzner_node_setup.pdf</a>.
+Tested setup: Hetzner Robot dedicated, Ubuntu 24.04, with a **spare raw NVMe** for the `kfd` thin-pool. Dual-NVMe boxes (no third drive): put Ubuntu on **one** disk (`SWRAID 0`) and leave the other raw — see [Hetzner node setup](https://github.com/Katakate/k7/blob/main/tutorials/k7_hetzner_node_setup.md). Do **not** pin `--disk /dev/nvme1n1`: NVMe names swap across reboots; the playbook auto-detects the empty non-root disk.
 </Info>
 
 ## Install the CLI (APT)
@@ -43,13 +44,15 @@ sudo apt install k7
 
 ## Install K7 on your node(s)
 
-This installs and wires up Kubernetes (K3s), Kata, Firecracker, Jailer, and the devmapper snapshotter with thin‑pool provisioning:
+`k7 install` with no flags provisions **both Kata backends** (`kfd` + `kql`) on localhost. Add `k7d` explicitly for the warm-fork microVM runtime. The playbook in k7 **0.2.2+** downloads [k7d 0.2.1](https://github.com/Katakate/k7d/releases/tag/v0.2.1) by default; **PPA `k7` 0.2.1 still defaults k7d to 0.1.0**, so pin the version:
 
 ```bash
-k7 install
+k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
 ```
 
-![Example output: k7 install](/images/ex-install.png)
+That installs and wires up Kubernetes (K3s), Kata, Firecracker + Jailer + thin-pool (`kfd`), QEMU + Longhorn (`kql`), and the k7d daemon + `RuntimeClass k7`. Pass `-v` for verbose output. Two-node / HA inventories: [Multi-node clusters](/k7/guides/multi-node).
+
+![Example output: k7 install](/k7/images/ex-install.png)
 
 <Check>
 You should see "Installation completed successfully!" when done. Add `-v` for verbose output.
@@ -77,10 +80,13 @@ k7 api endpoint
 ### Generate an API key
 
 ```bash
-k7 generate-api-key mykey
+k7 generate-api-key mykey                 # unrestricted (all namespaces)
+k7 generate-api-key tenant-a -n team-a    # scoped to one namespace (repeat -n)
 ```
 
-![Example: k7 generate-api-key](/images/ex-generate-api-key.png)
+A scoped key cannot list or mutate another namespace, and cannot run all-namespaces operations. Keys without `-n` keep unrestricted access (backward compatible).
+
+![Example: k7 generate-api-key](/k7/images/ex-generate-api-key.png)
 
 ### Temporarily disable / re-enable the API
 
@@ -121,9 +127,16 @@ egress_whitelist: []
 ```bash
 # Uses k7.yaml in the current directory by default
 k7 create
+
+# Or pick a backend (kfd | kql | k7d)
+k7 create -f k7.yaml --backend k7d
 ```
 
-![Example: k7 create](/images/ex-create.png)
+<Note>
+CLI `k7 create` with no `--egress` / `--egress-open` **blocks all egress**. An API/YAML request that omits `egress_whitelist` leaves egress **open**. Use `--egress-open` or omit the field in YAML when you want the internet.
+</Note>
+
+![Example: k7 create](/k7/images/ex-create.png)
 
 ### Shell into your sandbox
 
@@ -131,7 +144,7 @@ k7 create
 k7 shell demo
 ```
 
-![Example: k7 shell](/images/ex-shell.png)
+![Example: k7 shell](/k7/images/ex-shell.png)
 
 ### List sandboxes
 
@@ -139,7 +152,7 @@ k7 shell demo
 k7 list
 ```
 
-![Example: k7 list](/images/ex-list.png)
+![Example: k7 list](/k7/images/ex-list.png)
 
 ### Delete a sandbox
 
