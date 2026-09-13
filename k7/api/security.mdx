@@ -124,15 +124,47 @@ Adding `NET_RAW` or `NET_ADMIN` significantly reduces isolation. Only use when a
 
 ## Network isolation and egress lockdown
 
-### Ingress isolation (Default: Enabled)
+### Platform isolation (always on, Cilium)
 
-**All inter-VM communication is blocked by default** to prevent sandbox-to-sandbox access. This provides strong isolation between different sandboxes running in the same cluster.
+A cluster-wide deny-only policy (`k7-sandbox-platform-deny`) stops every sandbox — in every egress mode, including open egress — from reaching the nodes, the Kubernetes API server, cloud metadata / link-local, and the `kube-system` / `longhorn-system` pods except CoreDNS. Nothing to configure; not available on `--cni flannel`.
+
+### Ingress isolation (Default: deny all, opt-in per sandbox)
+
+**All inter-VM communication is blocked by default** to prevent sandbox-to-sandbox access.
 
 **Key points:**
-- **Ingress blocking**: VM sandboxes cannot communicate with each other by default
+- **Ingress blocking**: VM sandboxes cannot communicate with each other unless a port is opened
 - **Administrative access preserved**: `kubectl exec` and `k7 shell` still work normally (they use the Kubernetes API, not pod networking)
 - **System services allowed**: Traffic from `kube-system` namespace is permitted for cluster functionality
-- **No configuration needed**: This security feature is enabled by default for all sandboxes
+
+Open ports with `ingress_ports`, scope the callers with `ingress_from`, and publish outside the cluster with `expose_ports`:
+
+```json
+{
+  "name": "api",
+  "image": "python:3.12-slim",
+  "ingress_ports": [8000],
+  "ingress_from": ["sandbox:frontend", "namespace:team-a"]
+}
+```
+
+```json
+{
+  "name": "web",
+  "image": "python:3.12-slim",
+  "ingress_ports": [8000],
+  "ingress_from": ["cidr:203.0.113.0/24"],
+  "expose_ports": [8000]
+}
+```
+
+- `ingress_ports` without `ingress_from` = reachable from other sandboxes in the same namespace only. Reaching a sandbox from anywhere requires `"cidr:0.0.0.0/0"`, spelled out.
+- Every entry in `expose_ports` must also be in `ingress_ports`; the `NodePort` Service uses `externalTrafficPolicy: Local` so the pod sees the real client IP, and only answers on the node running the sandbox. The allocated NodePorts come back as `node_ports` on list / get.
+- `ingress_from` without `ingress_ports`, an unknown source prefix, or an `expose_ports` entry missing from `ingress_ports` is a `400`.
+
+<Warning>
+On Cilium a `cidr:` peer is **not** evaluated for pod-to-pod traffic, so a rule whose sources are all `cidr:` opens the port to every sandbox in the cluster. Use `cidr:` for external clients (`expose_ports`) and `sandbox:` / `namespace:` to scope in-cluster access. See [Networking](/k7/concepts/networking#ingress-denied-by-default-opt-in-per-sandbox).
+</Warning>
 
 ### Egress lockdown and whitelisting
 
@@ -187,7 +219,16 @@ Do not whitelist public DNS resolver IPs (e.g., 1.1.1.1, 8.8.8.8). A CIDR allowl
 
 - Listed namespaces only — another namespace returns `403 Forbidden`.
 - All-namespaces list / GC (`namespace` omitted or `all_namespaces=true`) is denied for scoped keys.
+- Cluster-scoped reads (`GET /api/v1/nodes/storage`) are denied for scoped keys too.
 - Keys without a scope keep full cross-namespace access.
+
+## Transport
+
+The API is served over HTTPS by default (Caddy sidecar, cluster CA at `/etc/k7/tls/ca.crt` unless `--api-hostname` or an operator certificate was used at install). Operators can additionally restrict the NodePort to known client CIDRs with `k7 install --api-allow-cidr` (Cilium only). Neither is rate limiting. See [Security model](/k7/concepts/security-model#api-transport-tls).
+
+## `docker: true`
+
+Turning on Docker changes what bounds the guest: on `k7d` / `k7d-fc` the sandbox container stays unprivileged but `docker.sock` is guest root; on `kfd` / `kql` a privileged `docker-vehicle` container runs in the same Kata VM. The isolation boundary is the VM either way — use `k7d-fc` when tenants do not trust each other. See [Docker in a sandbox](/k7/guides/docker).
 
 ## Image registry allowlist (SSRF)
 

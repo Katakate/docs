@@ -79,9 +79,29 @@ Stock Ubuntu 24.04 root disk, systemd, distro kernel; 3 VMs at 2 GiB / 2 vCPU un
 | JobSet on mock GPUs | 1 s | 298 ms | `test_ubuntu_ml_jobset_gpu_fork` |
 | KubeRay on mock GPUs | 1 s | 580 ms | `test_ubuntu_ml_kuberay_gpu_fork` |
 | Soft-RoCE | 1 s | 540 ms | `test_ubuntu_ml_rdma_soft_roce_fork` |
+| **Redis mid-write cluster warm fork** (AOF on, `INCR` loop in flight) | 1 s | **575 ms** client / 568 ms daemon | `test_redis_midwrite_ubuntu_fork` |
 | Host RAM per Ubuntu k3s node | finding | ~1.1–1.4 GiB | — |
 
 Six CoW disks and twice the guest RAM (Longhorn) still fork inside the ceiling the 2 GiB clusters were measured against: fork cost tracks the number of devices and page tables, not the volume of storage behind them. The pull is the long pole every time, not the fork.
+
+## Firecracker engine (`k7-fc`)
+
+`backend: firecracker` trees have no `MAP_PRIVATE` mapping to fork from: a point is a Firecracker **Diff** snapshot `FICLONERANGE`d onto a reflinked base, and every child is a fresh jailed Firecracker `LoadSnapshot`ed from its own reflink. Ceilings (500 ms per child, children answer `ping` within 500 ms) are asserted in `test_fc_tree.rs` / `test_fc_cluster.rs`. Exclusive Hetzner node, 2026-09-08, Firecracker v1.16.1, 256 MiB / 1 vCPU busybox guests:
+
+| Operation | Ceiling | Typical | Test |
+|---|---|---|---|
+| Root point at `tree_create` (first Diff, 43 MiB) | — | 169 ms | `test_fc_tree_fork_cow_isolation_diff` |
+| `prepare_fork_source` (Diff, ~1–2 MiB dirtied) | recorded | 140–157 ms | `test_fc_tree_latency_table` |
+| `fork_batch` n=1 | 500 ms | **190 ms**; child `ping` 5 ms after return | `test_fc_tree_latency_table` |
+| `fork_batch` n=8 | 500 ms per child | **607 ms** = 76 ms per child | `test_fc_tree_latency_table` |
+| `rollback` (load the existing point) | 500 ms | 75–90 ms | `test_fc_tree_rollback_is_the_point_and_clock_is_realtime` |
+| Root point, `K7D_FC_FORK_SNAPSHOT=full` (256 MiB written) | — | 638 ms | `test_fc_tree_fork_cow_isolation_full` |
+| Cluster `fork_batch` n=1 (3 members) | recorded | ~0.67 s (debug build) | `test_fc_cluster_fork_ping_and_skew_p99` |
+| Parallel pause skew p50 / p99 (20 runs) | p99 < 50 ms | 27 µs / 125 µs | same |
+| Cluster suspend / resume (2 members) | recorded | ~2.1 s / ~512 ms (debug build) | `test_fc_cluster_suspend_resume` |
+| Pool acquire (`K7D_POOL_BACKEND=firecracker`) | 2 s | ~100 ms | `test_fc_pool_acquire` |
+
+The point is O(dirty) and the base is O(1); the 50–75 ms per child is staging a chroot, leasing a uid, spawning `jailer` and waiting for its API socket — what a warm pool of pre-staged jails recovers. Do not measure a child with `du`: its `load.mem` reports 256 MiB of `st_blocks` while owning no extent; the tests check `FIEMAP_EXTENT_SHARED` instead. PodOverhead for the RuntimeClass (32 MiB / 50m) is derived in [`OVERHEAD.md`](https://github.com/katakate/k7d/blob/main/OVERHEAD.md). See [Backends](/k7d/concepts/backends).
 
 ## Keyframes: O(divergence)
 

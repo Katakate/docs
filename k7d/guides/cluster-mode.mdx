@@ -48,6 +48,8 @@ Once rooted, a cluster tree uses the same verbs as a single-VM tree — every op
 
 Responses carry one `guest_cids` entry per member (ordered by `vm_index`), so your harness can dial each member's agent, and `latency_ns` — the daemon's own wall time for the fork, which is what the budgets are asserted on. Batch cluster forks run sequential warm forks — each branch gets its own bridge.
 
+On the Firecracker engine (`backend: firecracker`) the same verbs apply: members are paused in parallel (skew p99 ≈ 125 µs), each takes a Diff snapshot onto a reflinked base, and every child is a fresh jailed Firecracker restored from its own reflink — ~0.67 s for a 3-member busybox cluster in a debug build, versus ~105 ms native. Suspend exports the point out of the jail; resume re-stages a jail and restores with the member's network identity. See [Backends](/k7d/concepts/backends).
+
 The `fork_memory_full_copy` flags in fork responses tell you whether each member forked CoW (`false`, the expected fast path) or had to fall back to a full memory copy (`true` — happens only for virtiofs-backed sources, e.g. pods with read-write hostPath mounts).
 
 ### Forking from a child

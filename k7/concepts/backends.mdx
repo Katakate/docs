@@ -1,28 +1,34 @@
 ---
 title: "Backends"
-description: "kata-firecracker-devmapper vs kata-qemu-longhorn vs k7d — how to choose"
+description: "kfd vs kql vs k7d vs k7d-fc — how to choose"
 ---
 
-A **backend** in Katakate combines a VM runtime with a storage driver. There are three: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), and `k7d`.
+A **backend** in Katakate combines a VM runtime with a storage driver. There are four: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), `k7d`, and `k7d-fc`. A node can install any combination (`k7 install --backend kfd,kql,k7d,k7d-fc`) and each sandbox picks one (`k7 create --backend …`).
 
 <Note>
-**Deprecated aliases:** `fd` and `ql` (and the long names without the `kata-` prefix) are older names for `kfd` / `kata-firecracker-devmapper` and `kql` / `kata-qemu-longhorn`. They still resolve for backwards compatibility, but new configs should use the current names.
+**Deprecated aliases:** `fd` and `ql` (and the long names without the `kata-` prefix) are older names for `kfd` / `kata-firecracker-devmapper` and `kql` / `kata-qemu-longhorn`. They still resolve for backwards compatibility, but new configs should use the current names. `k7-fc` is accepted as an alias of `k7d-fc`.
 </Note>
 
 ## At a glance
 
-| | `kata-firecracker-devmapper` (`kfd`) | `kata-qemu-longhorn` (`kql`) | `k7d` |
-|--|------------------------------|-----------------------|-------|
-| Runtime class | `kata` | `kata-qemu` | `k7` |
-| Hypervisor | Firecracker (microVM) via Kata | QEMU via Kata | [k7d](/k7d/index) — purpose-built Rust VMM |
-| Process isolation | **Jailer** (chroot, dropped caps, seccomp) | Kata's built-in sandboxing | KVM hardware isolation (see [k7d security model](/k7d/concepts/security)) |
-| Storage driver | LVM thin-pool + containerd devmapper snapshotter | Longhorn CSI (replicated PVCs) | erofs images on virtio-blk + host-local state |
-| Persistent disk per sandbox | Ephemeral (devmapper LV, lost on delete) | Yes — `<sandbox>-root-lh` PVC, sized via `--root-disk-size` | Host-local VM state |
-| Snapshots / pause / resume / fork | ❌ Not supported | ✅ Disk-level, via VolumeSnapshots (~45 s fork) | ✅ Full VM state (memory + disk + processes + network), ~5 ms warm fork |
-| Multi-node replication | ❌ Node-local thin pool | ✅ Longhorn replicas across nodes | ❌ Host-local trees today |
-| Cold-create latency | Faster (microVM boot) | Slower (full VM boot + PVC bind) | ~163 ms VM boot to agent ready |
-| Privileged container required | No | **Yes** (for the bind-mount persistence wrapper) | No |
-| Best for | Many small ephemeral workloads, AI agents, CI runners | Long-lived workloads, replicated state | Fork-heavy workflows: RL rollouts, agent tree search, snapshot trees |
+| | `kfd` — kata-firecracker-devmapper | `kql` — kata-qemu-longhorn | `k7d` | `k7d-fc` |
+|--|---|---|---|---|
+| Runtime class | `kata` | `kata-qemu` | `k7` | `k7-fc` |
+| Hypervisor | Firecracker (microVM) via Kata | QEMU via Kata | [k7d](/k7d/index) — purpose-built in-process Rust VMM | The same k7d daemon driving **stock Firecracker under the stock jailer** |
+| Process isolation | **Jailer** (chroot, dropped caps, seccomp) | Kata's built-in sandboxing | KVM hardware isolation; one daemon hosts every VM (see [k7d security model](/k7d/concepts/security)) | KVM **plus** a per-VM jailer (own uid, chroot, pid namespace, cgroup, Firecracker seccomp) |
+| Storage driver | LVM thin-pool + containerd devmapper snapshotter | Longhorn CSI (replicated PVCs) | erofs images on virtio-blk + reflink-XFS volume images | Same as k7d (erofs / scratch on virtio-blk); **no virtiofs / hostPath** |
+| Persistent disk per sandbox | Ephemeral (devmapper LV, lost on delete) | Yes — `<sandbox>-root-lh` PVC, sized via `--root-disk-size` | Host-local VM state | Host-local VM state |
+| Named snapshots (`k7 snapshot`) / `k7 restore` | ❌ | ✅ Disk-level VolumeSnapshots | ❌ by design (fork the live sandbox instead) | ❌ (same as k7d) |
+| `k7 fork` | ❌ Rejected | ✅ Disk clone + cold boot (~45 s) | ✅ Warm CoW fork of memory **and** disk (~5 ms at the VMM, ~2.4 s end-to-end) | ✅ Same daemon path (Firecracker Diff snapshot → reflinked base → `LoadSnapshot`), ~2.5 s end-to-end |
+| `k7 pause` / `resume` | Scale to 0 / 1 (state lost) | Scale to 0 / 1, disk persists | VM frozen in place: vCPUs stop, memory stays (0.2 s / 0.3 s) | Same daemon path (0.2 s pause; see note below) |
+| Docker in the VM (`--docker`) | ✅ Privileged `docker-vehicle`, overlay2 on an ephemeral LVM block LV | ✅ Privileged `docker-vehicle`, overlay2 on a Longhorn Block PVC (survives pause / fork / restore) | ✅ Agent-supervised in-guest `dockerd`, overlay2 on virtio-blk, **forkable** | ✅ Same guest `dockerd`, **forkable** |
+| Multi-node replication | ❌ Node-local thin pool | ✅ Longhorn replicas across nodes | ❌ Host-local trees today | ❌ |
+| Cold-create latency | Faster (microVM boot) | Slower (full VM boot + PVC bind), ~17 s | ~2.1 s to a Ready pod | ~2.1 s to a Ready pod |
+| Privileged container required | No (unless `--docker`) | **Yes** (for the bind-mount persistence wrapper) | No | No |
+| Architecture | amd64, arm64 | amd64, arm64 | **amd64 / x86_64 only** | **amd64 / x86_64 only** |
+| Best for | Many small ephemeral workloads, AI agents, CI runners | Long-lived workloads, replicated state | Fork-heavy workflows: RL rollouts, agent tree search, snapshot trees | k7d's fork/pause lifecycle **and** a per-VM jailer — multi-tenant `--docker` |
+
+Numbers are medians of 3 on one Hetzner AX41 node; ranges and methodology are in [PERFORMANCE.md](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md).
 
 ## Choosing a backend
 
@@ -36,17 +42,24 @@ Pick **`kata-firecracker-devmapper`** when:
 Pick **`kata-qemu-longhorn`** when:
 
 - You need a real persistent disk that survives pod restarts (`/mnt/state` mount inside the sandbox).
-- You want to `pause` / `resume` / `fork` sandboxes at the disk level.
+- You want to `pause` / `resume` / `fork` sandboxes at the disk level, or `k7 snapshot` / `k7 restore` named snapshots.
 - You run multi-node and want data to survive node failure (Longhorn replicates).
-- You need bigger root disks (sized with `--root-disk-size`).
+- You need bigger root disks (sized with `--root-disk-size`), or a Docker graph that survives pause / fork / restore.
 
 Pick **`k7d`** when:
 
 - Fork latency matters: k7d warm-forks a running VM in ~5 ms with faithful memory, disk, process, and network state — versus ~45 s for a disk-only Longhorn fork.
 - You want snapshot trees: fork many branches from a checkpoint, protect winners, prune losers, under RAM/disk budgets.
 - Your workload is RL training or agent tree search over many resettable environments.
+- You want a forkable Docker engine: `k7 create --docker --backend k7d` runs `dockerd` inside the guest and `k7 fork` clones it, running inner containers included.
 
-See the [K7d documentation](/k7d/index) for the runtime's own concepts, API, and benchmarks.
+Pick **`k7d-fc`** when:
+
+- You want k7d's fork / pause lifecycle **and** Firecracker's jailer around every VM — a separate VMM process per sandbox with its own uid, chroot, pid namespace, cgroup, and Firecracker's default seccomp. A guest-to-VMM escape lands in that jail instead of the k7d daemon.
+- You run `--docker` for mutually distrusting tenants. The guest side is identical to `k7d`, so this is a RuntimeClass switch, not a rewrite.
+- You can live without virtiofs / hostPath volumes (refused up front on `k7d-fc`) and without k7d's [time warp](/k7d/guides/time-warp).
+
+See the [K7d documentation](/k7d/index) for the runtime's own concepts, API, and benchmarks, and [Backends: native vs Firecracker](/k7d/concepts/backends) for how the k7d daemon selects the engine.
 
 <Note>
 **Cluster fork is a k7d feature, not a k7 feature.** Forking an entire live Kubernetes cluster (~100 ms for a 3-node cluster) is done by the k7d runtime directly, through its own daemon API — see [Cluster mode](/k7d/guides/cluster-mode). k7's `fork` command clones a single sandbox.
@@ -63,8 +76,9 @@ k7 install --backend kfd --disk /dev/nvme2n1   # pin the thin-pool disk explicit
 k7 install --backend kql                       # kata-qemu-longhorn only, no raw disk needed
 k7 install --backend kql --longhorn-extra-disk /mnt/longhorn-extra   # optional extra storage
 k7 install --backend k7d                       # k7d runtime (daemon + shim + RuntimeClass k7)
-k7 install --backend k7d --k7d-version 0.2.1   # pin the k7d release (k7 0.2.2+ default; required on PPA 0.2.1)
-k7 install --backend k7d --k7d-artifact /root/k7d-v0.2.1-x86_64-linux.tar.gz   # install from a local tarball
+k7 install --backend k7d,k7d-fc                # add pinned Firecracker + jailer and RuntimeClass k7-fc
+k7 install --backend k7d --k7d-version 0.6.0   # pin the k7d release (playbook default: 0.6.0)
+k7 install --backend k7d --k7d-artifact /root/k7d-v0.6.0-x86_64-linux.tar.gz   # install from a local tarball
 k7 install --backend kfd,kql --longhorn-extra-disk /mnt/longhorn-extra   # omit --disk on dual-NVMe (auto-detect)
 k7 install -i inventory.ini                    # multi-node, per-host backends
 k7 install -i inventory.ini --ha               # multi-master HA (3+ servers, embedded etcd)
@@ -79,10 +93,11 @@ k7 create --image alpine:3.20 demo
 # Explicit
 k7 create --backend kql --image alpine:3.20 demo
 k7 create --backend k7d --image alpine:3.20 demo
+k7 create --backend k7d-fc --docker --image ubuntu:24.04 builder
 
 # In YAML
 # k7.yaml:
-backend: kata-qemu-longhorn   # or kata-firecracker-devmapper, k7d — or alias kql / kfd
+backend: kata-qemu-longhorn   # or kata-firecracker-devmapper, k7d, k7d-fc — or alias kql / kfd / k7-fc
 ```
 
 If the requested backend isn't available on any node, you'll see a clear `FailedScheduling` message listing which backends are.
@@ -97,13 +112,16 @@ If the requested backend isn't available on any node, you'll see a clear `Failed
 - Image `ENTRYPOINT`+`CMD` are preserved by default — override with `--entrypoint` / `--cmd`.
 - `pause` takes a crash-consistent VolumeSnapshot before scaling to 0 (optional; pass `--snapshot <name>`).
 - `fork` snapshots the source PVC, clones it via Longhorn's CSI VolumeSnapshot+Restore, then creates a new Deployment pointing at the cloned PVC.
+- `--docker` adds a second Longhorn **Block** PVC (`<name>-docker-lh`, default 20Gi via `--docker-disk`) for the overlay2 graph; it is included in pause / fork / restore. The two VolumeSnapshots are crash-consistent per volume, not cross-volume atomic.
 
 ### kata-firecracker-devmapper
 
 - Sandbox storage is a per-pod logical volume on the LVM thin-pool — fast to create, lost on delete.
 - The Firecracker process runs **inside the jailer**: a chroot, with dropped capabilities and a restrictive seccomp filter, as an unprivileged UID.
+- Kata's guest seccomp is enforced (`disable_guest_seccomp = false`): the container's `RuntimeDefault` seccomp profile is applied by the in-guest runtime, not silently dropped.
 - No `pause`/`resume`/`fork` — there's no persistent disk to snapshot.
 - `--root-disk-size` has no effect (warned by the CLI).
+- `--docker` puts the overlay2 graph on a generic ephemeral volume from StorageClass `k7-docker-lvm` (OpenEBS LVM LocalPV over `kata-vg/thin-pool`); it is deleted with the pod and `k7 fork` of a kfd `--docker` sandbox is rejected. Docker-heavy kfd nodes share the thin-pool with these LVs — size `kata_thinpool_pv_size` accordingly.
 
 ### k7d
 
@@ -111,6 +129,16 @@ If the requested backend isn't available on any node, you'll see a clear `Failed
 - Fork copies the **whole VM**: memory, disk, processes, and network identity — not just the disk. Warm fork is ~5 ms.
 - Multi-vCPU guests are supported: the vCPU count is derived from the pod's CPU limit (`cpu: "2"` boots a 2-vCPU guest), with fork/snapshot parity.
 - **VM ops work for sandboxes on any node.** The k7d daemon and its socket are node-local, but `k7 pause` / `resume` / `fork` through the API are forwarded to the `k7-agent` DaemonSet pod on the sandbox's node when needed. A fork still lands on the **source's node** (cross-node fork is on the k7d roadmap).
-- Warm fork works for single-workload sandboxes; forking a sandbox with a sidecar is rejected (use `kql` for that).
+- `--docker` does **not** add a second container: the pod is stamped `k7d.katakate.org/docker=true` and the guest agent (PID 1) supervises a pinned `dockerd` whose graph lives on a per-sandbox virtio-blk scratch disk (overlay2, default 20Gi). Because it is not a CRI sidecar, `k7 fork` of a `--docker` sandbox works — the child keeps `dockerd` and its running inner containers. Requires k7d **0.6.0+** (payload at `/usr/local/share/k7d/docker`); an older k7d fails loudly with `this k7d has no docker service; upgrade`.
+- Warm fork works for single-workload sandboxes (including `--docker`); forking a sandbox with a **real CRI sidecar** is rejected (use `kql` for that).
 - Per-node k7d disk-pool utilization is visible via `k7 nodes storage` (see [CLI reference](/k7/guides/cli)).
 - See [RuntimeClass k7](/k7d/guides/runtime-class) for how the runtime is registered, and the [feature matrix](/k7d/guides/feature-matrix) for current Kubernetes feature support.
+
+### k7d-fc
+
+- Same daemon, shim, guest agent, and `--docker` service as `k7d`; pods use `runtimeClassName: k7-fc`. The daemon boots the guest on **upstream Firecracker v1.16.1 under the upstream jailer** (sha-pinned binaries installed to `/usr/local/bin` by the playbook — a different binary from Kata's `/opt/kata/bin` Firecracker used by `kfd`).
+- `k7 install --backend k7d-fc` writes `/etc/k7d/shim-k7-fc.toml` (`backend = "firecracker"`), registers containerd `runtimes.k7-fc` with a `ConfigPath` option (and no `BinaryName`), creates RuntimeClass `k7-fc` with a PodOverhead of `32Mi` / `50m`, and labels the node `k7.katakate.org/backend-k7d-fc=true` (plus `backend-k7d`, so native `k7d` pods still schedule there).
+- Fork and pause go through the same `/run/k7d/k7d.sock` verbs and `fork-source-*` annotations as `k7d`. Under the hood a fork is a Firecracker Diff snapshot materialised onto a reflinked base image and `LoadSnapshot`ed into a fresh jail (~2.5 s end-to-end via k7; ~2.45 s fork→exec measured).
+- **hostPath / PVC `volumes` are refused at create time** — Firecracker has no virtiofs. Time warp / dilation is unavailable on this backend.
+- Known issue: after `k7 pause` / `k7 resume`, CRI exec into a `k7d-fc` sandbox has been observed to hang on the current cut (k7d CHALLENGES #17). Pause itself returns in ~0.2 s; do not rely on resume→exec on `k7d-fc` yet.
+- Requires k7d **0.6.0+** (Firecracker engine + `ConfigPath`). The stock 0.5.0 tarball does not know `ConfigPath` and the RuntimeClass will not come up.

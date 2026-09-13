@@ -9,7 +9,7 @@ The k7d daemon exposes its control plane on a Unix socket, by default **`/run/k7
 
 ```bash
 echo '{"op":"ping"}' | socat - UNIX-CONNECT:/run/k7d/k7d.sock
-# {"status":"pong","version":"0.4.0"}
+# {"status":"pong","version":"0.6.0"}
 ```
 
 <Note>
@@ -23,7 +23,7 @@ Reference clients: a thin Python client covering the tree verbs in [`examples/cl
 | `op` | Fields | What it does |
 |---|---|---|
 | `ping` | — | Liveness check. → `pong` with the daemon `version` |
-| `doctor` | — | Host readiness: `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`, cgroup v2. Same checks as `k7d doctor`; creates no VM. → `doctor` with `kvm`, `vhost_vsock`, `tun`, `cgroup_v2`, `ok`, `details[]` |
+| `doctor` | — | Host readiness: `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`, cgroup v2. Same checks as `k7d doctor`; creates no VM. → `doctor` with `kvm`, `vhost_vsock`, `tun`, `cgroup_v2`, `ok`, `fc_fork_mode` (`diff` \| `full`, from `K7D_FC_FORK_SNAPSHOT`), `details[]` |
 | `pool_status` | — | Warm-pool sizing and hit/miss counters. Always answers, even with the pool disabled (`size: 0`) |
 
 ## VM lifecycle operations
@@ -38,6 +38,7 @@ Reference clients: a thin Python client covering the tree verbs in [`examples/cl
 | `dump_serial` | `vm_id` or `guest_cid` | Read a VM's accumulated serial console output (guest kernel messages, agent stderr). The `guest_cid` form also finds live VMs inside snapshot trees. → `serial_dump` |
 | `fork_vm` | `vm_id`, `sandbox_id?`, `dilation?` | Warm-fork a daemon-owned VM into a new daemon-owned VM. The first fork of a VM prepares it as a fork source on the **same vsock CID** (echoed as `source_guest_cid`). `sandbox_id` registers the fork like a `create_vm`-born sandbox VM. → `vm_forked` with `vm_id`, `guest_cid`, `source_guest_cid`, `dilation` |
 | `delete_data_disk` | `id` | Delete a named persistent data disk's image — the only way its data goes away. Loud error if the image is missing or a live VM still has it attached |
+| `update_drive` | `vm_id`, `device_index`, `host_path` | Firecracker only: re-point block device `i` (`/dev/vd{a+i}`) at a new host file via `PATCH /drives` — how image slots are filled after boot. Sending it to a native VM is an error, not a no-op |
 | `lookup_sandbox` | `sandbox_id` | Resolve a CRI sandbox to its live VM. → `sandbox_found` |
 | `reattach_sandbox` | `sandbox_id` | Like `lookup_sandbox`, but verifies the guest agent still answers before handing the VM back to a respawned shim. Dead VMs are torn down; stale records garbage-collected (both return `error`) |
 
@@ -62,9 +63,11 @@ The `config` object accepted by `create_vm` (and the tree-create operations):
 | `data_disks` | array | `[]` | `{id, size_bytes, guest_mount}` — **named persistent** ext4 disks that outlive the VM. Created and formatted on first use, reused as-is on later attaches; a `size_bytes` that disagrees with the existing image is an error, not a resize. Only `delete_data_disk` removes one |
 | `sandbox_id` | string | none | Caller-supplied sandbox identity, echoed in `list_vms` and used by `lookup_sandbox` / `reattach_sandbox` |
 | `network` | object | none | `{cluster_id, vm_index?, pod_netns?}` — join (or create) the shared bridge `k7-br-{cluster_id}`; `vm_index` pins the IP/MAC (fork pods reuse the source's), `pod_netns` moves the TAP into a CNI pod netns |
+| `backend` | `native` \| `firecracker` | `native` | Which VMM owns the KVM fd: k7d's in-process engine, or a stock Firecracker under the stock jailer ([Backends](/k7d/concepts/backends)). Firecracker rejects `virtiofs` and `dilation > 1` with a named error rather than ignoring them |
+| `docker` | object | none | `{graph_size_bytes}` — run a pinned `dockerd` as an agent-supervised guest service with an `overlay2` graph on a dedicated per-VM scratch disk (reflinked on fork, deleted with the VM). The shim sets it from `k7d.katakate.org/docker` / `docker-disk` |
 | `dilation` | u32 | `1` | Continuous [time dilation](/k7d/guides/time-warp): guest time runs this many times faster than wall time for the life of the VM. Every member of a cluster is created from one `VmConfig`, so a cluster is dilated in lockstep by construction. A host without the KVM dilation patch fails VM creation for `dilation > 1` instead of silently running at 1× |
 
-`vm_created` responses carry `vm_id`, `guest_cid`, `vm_index` (determines the guest IP `10.200.0.{2 + vm_index}`), `pod_netns_attached`, and `pooled` (whether the VM was served from the warm pool instead of cold-booted).
+`vm_created` responses carry `vm_id`, `guest_cid`, `vm_index` (determines the guest IP `10.200.0.{2 + vm_index}`), `pod_netns_attached`, and `pooled` (whether the VM was served from the warm pool instead of cold-booted). `vm_list` entries carry `backend` and, for Firecracker VMs, `jail` — `{pid, uid, chroot}` of the jailed VMM process, the only handles an operator has on it (`k7d doctor` prints them too).
 
 ## Tree operations
 
@@ -88,6 +91,7 @@ Snapshot-tree semantics (budgets, LRU eviction, protect/prune, keyframes) are ex
 | `tree_list` | — | All trees: `{tree_id, kind ("vm"/"cluster"), nodes, usage, budget}`. → `tree_list` |
 | `tree_watch` | `tree_id?` | Subscribe this connection to tree mutations. First reply is `tree_watching` (a snapshot per matched tree); then one `tree_event` line per `fork` / `protect` / `unprotect` / `suspend` / `resume` / `prune` / `evict` / `drop` until the client hangs up. The connection is event-only afterwards |
 | `tree_drop` | `tree_id` | Forget a tree: live payloads torn down, on-disk state kept |
+| `tree_open` | `tree_id` | Re-open an on-disk tree left by `tree_drop` or a daemon crash. Every node comes back `Suspended` (live KVM is not resurrected) — `tree_resume` to go live. Loud error if `tree.json` is missing, unparseable, or the id is already in memory. → `tree_opened` |
 
 ### `TreeBudget`
 
@@ -163,6 +167,13 @@ The `auto_warp` reply carries `mode`, `holders`, and `stats`: `cycles`, `warps`,
 | `K7D_TREE_ROOT` | `/var/lib/k7d/trees` | Snapshot trees (`{root}/{tree_id}/`) |
 | `K7D_SANDBOX_ROOT` | `/var/lib/k7d/sandboxes` | Sandbox reattach records (`{sandbox_id}.json`) |
 | `K7D_POOL_SIZE` / `K7D_POOL_MEMORY_MB` / `K7D_POOL_VCPUS` | `0` / `256` / `1` | Warm pool: target idle VMs and the template they are booted from (`0` disables the pool) |
+| `K7D_POOL_BACKEND` | `native` | Engine of the pooled VMs: `native`, `firecracker`, or a split `native:N,firecracker:M` (N+M must equal `K7D_POOL_SIZE`) |
+| `K7D_FC_BINARY` / `K7D_FC_JAILER` | `/usr/local/bin/firecracker` / `/usr/local/bin/jailer` | Firecracker and jailer executables (what `utils/install-firecracker.sh` installs) |
+| `K7D_FC_CHROOT_BASE` | `/var/lib/k7d/fc` | Root of every Firecracker jailer chroot; must sit on the reflink XFS that holds the writable disks (hard-linked into the jail) |
+| `K7D_FC_UID_BASE` | `60000` | First uid/gid leased to a jailed Firecracker VM; 1024 live VMs per daemon, exhaustion is an error |
+| `K7D_FC_FORK_SNAPSHOT` | `diff` | Firecracker fork point: `diff` (O(dirty) pages onto a reflinked base) or `full` (all of guest RAM; for cross-checking, not a fallback) |
+| `K7D_ALLOWED_UIDS` | — | Comma-separated uids allowed to connect to the control socket (`SO_PEERCRED`); unset means any uid that can open the `0660` socket |
+| `K7D_DENY_VIRTIOFS_FALLBACK` | — | Set to `1` to fail Create for any pod that would take the read-write virtiofs hostPath fallback (hardened / Firecracker profiles) |
 | `K7D_NET_JAIL` | `enforce` | Per-tree nftables jail. `off` skips installation — the escape hatch for debugging; any other value is a loud error |
 | `K7D_NET_JAIL_CT_MAX` / `K7D_NET_JAIL_NEW_RATE` | `16384` / `2000` | Per-tree concurrent-connection cap and new-connection rate (pkt/s). `0` is refused |
 | `K7D_NET_JAIL_ALLOW_IFACES` | — | Comma-separated extra host interfaces treated as intra-node (allowed in every egress mode), on top of detected CNI interfaces |

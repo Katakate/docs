@@ -56,7 +56,7 @@
               "k7/guides/python-sdk",
               "k7/guides/multi-node",
               "k7/guides/snapshots-fork",
-              "k7/guides/sidecars",
+              "k7/guides/docker",
               "k7/guides/langchain-agent",
               "k7/guides/utilities"
             ]
@@ -99,6 +99,7 @@
               "k7d/concepts/network-identity",
               "k7d/concepts/snapshot-tree",
               "k7d/concepts/architecture",
+              "k7d/concepts/backends",
               "k7d/concepts/security"
             ]
           },
@@ -154,6 +155,12 @@
       "vscode"
     ]
   },
+  "redirects": [
+    {
+      "source": "/k7/guides/sidecars",
+      "destination": "/k7/guides/docker"
+    }
+  ],
   "footer": {
     "socials": {
       "github": "https://github.com/Katakate"

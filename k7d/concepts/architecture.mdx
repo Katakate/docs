@@ -1,6 +1,6 @@
 ---
 title: "Architecture"
-description: "The k7d stack: daemon, containerd shim, guest agent, two guests — who owns what"
+description: "The k7d stack: daemon, containerd shim, guest agent, two guests, two VMM engines — who owns what"
 ---
 
 k7d is three cooperating pieces of Rust plus a guest image — either the minimal busybox initramfs or a stock Ubuntu 24.04 node disk:
@@ -23,12 +23,14 @@ k7d is three cooperating pieces of Rust plus a guest image — either the minima
                      ┌────────────────────────────────────────┐
                      │  k7d daemon (k7d.service)              │  one process, one address space,
                      │  ┌────────────┐ ┌────────┐ ┌─────────┐ │  many VMs
-                     │  │ snapshot   │ │ KVM    │ │ clock   │ │  owns: KVM fds, guest memory,
-                     │  │ tree +     │ │ VMM    │ │ owner   │ │  vsock, TAPs/bridges, nft jail,
-                     │  │ budgets    │ │        │ │         │ │  cgroups, disks, virtiofsd
+                     │  │ snapshot   │ │ native │ │ clock   │ │  owns: KVM fds, guest memory,
+                     │  │ tree +     │ │ KVM    │ │ owner   │ │  vsock, TAPs/bridges, nft jail,
+                     │  │ budgets    │ │ VMM    │ │         │ │  cgroups, disks, virtiofsd
                      │  └────────────┘ └────────┘ └─────────┘ │
-                     └───────────────┬────────────────────────┘
-                                     │ KVM ioctls, mmap, eventfds, vhost, TAP
+                     └───────┬───────────────────┬────────────┘
+                             │ KVM ioctls, mmap  │ jailer → firecracker  (backend: firecracker,
+                             │ eventfds, vhost   │ own uid/chroot/pidns,  RuntimeClass k7-fc)
+                             │ TAP               │ REST API over UDS in the jail
  ════════════════════════════════════▼═════════════════════════════════ guest
                      ┌──────────────────────────┐   ┌──────────────────────────┐
                      │ minimal CI guest         │   │ Ubuntu 24.04 node        │
@@ -40,13 +42,15 @@ k7d is three cooperating pieces of Rust plus a guest image — either the minima
 
 ## Who owns what
 
-- **The daemon owns the VMs.** `k7d` runs as a long-lived systemd service and owns every VM's KVM file descriptors, guest memory, vsock, virtiofsd children, bridges, nftables jail tables, cgroups, disk images, and snapshot trees. Clients — the containerd shim, the K7 Python backend, your RL trainer, an MCP server — talk to it over a Unix socket, one JSON object per line. See [Daemon API](/k7d/api/protocol).
+- **The daemon owns the VMs.** `k7d` runs as a long-lived systemd service and owns every VM's KVM file descriptors, guest memory, vsock, virtiofsd children, bridges, nftables jail tables, cgroups, disk images, and snapshot trees. With `backend: firecracker` the KVM fd and guest memory move into a per-VM jailed Firecracker child process the daemon spawns and drives over its REST API; the daemon still owns everything else (see [Backends](/k7d/concepts/backends)). Clients — the containerd shim, the K7 Python backend, your RL trainer, an MCP server — talk to it over a Unix socket, one JSON object per line. See [Daemon API](/k7d/api/protocol).
 - **The daemon owns the guest clock.** Every guest reads `kvm-clock`; there is no RTC and no NTP client. Restore re-bases the clock with `KVM_SET_CLOCK` so a resumed guest knows the real time, and the same mechanism lets the daemon jump or dilate a whole cluster's clock in lockstep. See [Time warp](/k7d/guides/time-warp).
 - **The shim is a thin client.** containerd spawns one `containerd-shim-k7-v1` per pod; its sandbox `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly if the daemon is not running. Because VMs outlive shims, a respawned shim reattaches to its still-running VM (`reattach_sandbox`).
 - **The agent is not a Kubernetes component.** `k7-agent` is a tiny static binary — PID 1 in the minimal guest, a systemd unit on an Ubuntu node. It exposes a JSON-line RPC over vsock (commands like `ping`, `exec`, `read_file`, `write_file`, `container_start`, `container_exec`, `container_stop`, `container_output`). Clients reach the agent directly over vsock using the `guest_cid` the daemon returns — the daemon does not proxy the agent protocol.
-- **`runc` runs *inside* the guest**, never on the host. In the minimal guest the agent invokes it against erofs images on virtio-blk; on an Ubuntu node k3s' own containerd does.
+- **`runc` runs *inside* the guest**, never on the host. In the minimal guest the agent invokes it against erofs images on virtio-blk; on an Ubuntu node k3s' own containerd does. The agent can also supervise a pinned `dockerd` as a guest service (`k7d.katakate.org/docker`), which is how [`k7 create --docker`](/k7/guides/docker) works without a privileged sidecar.
 
-## Two guests, one VMM
+## Two guests, two engines
+
+Every daemon-owned VM is a `Guest` that is either `Native` (in-process rust-vmm, the default) or `Firecracker` (stock v1.16.1 under the stock jailer, `runtimeClassName: k7-fc`). Both boot the same guest images and speak to the same agent; the engine is selected per VM by `VmConfig.backend`, the `k7d.katakate.org/backend` annotation, or the RuntimeClass. [Backends](/k7d/concepts/backends) has the matrix.
 
 | | Minimal CI guest | Ubuntu node |
 |---|---|---|
@@ -66,9 +70,12 @@ The daemon is the only process that picks a guest: `create_vm` without a kernel 
 - **Rootfs via erofs on virtio-blk.** Read-only host paths are packed into cached erofs images and attached as block devices. This is what keeps cluster forks CoW: no per-fork memory copies for filesystem shares (the virtiofs path forced a full memory copy per fork and survives only as the fallback for read-write hostPath).
 - **CNI is the host network contract, not a Flannel special case.** When `network.pod_netns` is set, the daemon moves the TAP into the CNI-provided pod netns so the VM answers on the pod IP. That path follows the CNI netns + eth0 + pod IP contract; it works the same if Flannel is replaced or disabled.
 - **One jail per tree, on by default.** nftables per bridge, cgroup per tree, seccomp on the daemon, chroot on virtiofsd. See [Security model](/k7d/concepts/security#the-tree-jailer).
+- **The guest is hostile from its first instruction.** Every host path the guest can influence is opened `O_NOFOLLOW` / `RESOLVE_BENEATH` relative to a share-root fd, anything shared by several VMs is host-enforced read-only, agent strings never reach a host path or command line, and the pod's OCI confinement (seccomp, masked paths, device cgroups, capabilities) is passed through to guest runc rather than rewritten. See [Guest-controlled paths](/k7d/concepts/security#guest-controlled-paths).
 
 ## The "start a pod" path
 
 `kubectl apply` (with `runtimeClassName: k7`) → kubelet → containerd → exec `containerd-shim-k7-v1` → shim `create_vm` over the daemon socket (daemon builds the VM: kernel, initramfs, vsock, network, block devices incl. the scratch disk; ~163–205 ms to agent-ready, or served warm from the [pool](/k7d/api/protocol#host-operations)) → shim tells the agent to `container_start` the OCI bundle → agent runs `runc` → an output bridge polls `container_output` and writes into containerd's FIFOs — which is how `kubectl logs` works.
+
+On `runtimeClassName: k7-fc` the same sequence runs, except the daemon stages a chroot, leases a uid, spawns `jailer` → `firecracker`, configures it over the REST API (boot source, drives, TAP, vsock) and fills disk slots with `PATCH /drives`; the agent hop is unchanged.
 
 Setup steps for the RuntimeClass: [RuntimeClass k7](/k7d/guides/runtime-class).

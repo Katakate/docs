@@ -103,10 +103,10 @@ flowchart TB
 
 What this shows:
 
-- **Any server** can serve the API NodePort — clients can hit any of `node1..3` on `:31007`.
+- **Any server** can serve the API NodePort — clients can hit any of `node1..3` on `:31007` over HTTPS (one cluster CA, `/etc/k7/tls/ca.crt` on the first master, covers every node IP). If you installed with `--api-allow-cidr`, the Service switches to `externalTrafficPolicy: Local`, so only the node actually running the `k7-api` pod answers — point clients at that node (or run a load balancer in front that health-checks `:31007`).
 - **etcd quorum** spans the three servers. One server can fail without losing the control plane.
-- **Backend labels** decide where a sandbox lands. `--backend kfd` is restricted to `node1` and `node4`; `--backend kql` to `node1`, `node2`, `node3`; `--backend k7d` to `node1` and `node2`.
-- **k7d nodes** run the node-local `k7d` daemon (systemd unit, owns every `runtimeClassName: k7` microVM on that node) plus its XFS disk pool at `/var/lib/k7d/disks`.
+- **Backend labels** decide where a sandbox lands. `--backend kfd` is restricted to `node1` and `node4`; `--backend kql` to `node1`, `node2`, `node3`; `--backend k7d` (and `k7d-fc`, which shares the daemon and adds the `k7-fc` RuntimeClass) to `node1` and `node2`.
+- **k7d nodes** run the node-local `k7d` daemon (systemd unit, owns every `runtimeClassName: k7` and `k7-fc` microVM on that node) plus its XFS disk pool at `/var/lib/k7d/disks`. `k7d-fc` nodes additionally carry the pinned Firecracker + jailer binaries (`/usr/local/bin/firecracker`, `jailer`) and `/etc/k7d/shim-k7-fc.toml`.
 - **The `k7-agent` DaemonSet** runs on every node. The k7-api forwards k7d `pause` / `resume` / `fork` to the agent on the sandbox's node (shared-token auth, ingress restricted to the k7-api pod by a CiliumNetworkPolicy), so k7d VM ops work through the API **regardless of which node hosts the sandbox**. It also serves per-node storage-pool stats for `k7 nodes storage`.
 - **Longhorn replicas** of each `kata-qemu-longhorn` PVC are spread across `kql`-capable nodes (`longhorn_replicas=2` keeps two copies; `dataLocality: best-effort` keeps one local to the pod).
 - **Devmapper thin-pools and k7d disk pools** are per-node and not replicated — `kfd` sandboxes are ephemeral by design, and k7d fork/snapshot trees are host-local (a fork lands on the source's node; cross-node fork is on the k7d roadmap).
@@ -139,17 +139,17 @@ longhorn_replicas=2
 For a 3-node HA cluster with **all backends on every node**, one command from the first master brings everything up:
 
 ```bash
-k7 install -i inventory.ini --ha --k7d-version 0.2.1
+k7 install -i inventory.ini --ha --k7d-version 0.6.0
 ```
 
 Two-node (one server + one agent, **no `--ha`** — embedded etcd needs 3+ servers). After each box has Ubuntu on one NVMe and a raw spare (`TWO_DISK`):
 
 ```ini
 [k7_servers]
-k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
+k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d,k7d-fc
 
 [k7_agents]
-k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
+k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d,k7d-fc
 
 [k7_cluster:children]
 k7_servers
@@ -162,7 +162,7 @@ longhorn_replicas=2
 ```
 
 ```bash
-k7 install -i inventory.ini --k7d-version 0.2.1
+k7 install -i inventory.ini --k7d-version 0.6.0
 ```
 
 Don't pass `--backend` alongside `-i`: the per-host `k7_backends` in the inventory is authoritative (an explicit `--backend` overrides it).
@@ -177,7 +177,7 @@ On dual-NVMe boxes where the OS lives on one disk and the other is a raw spare, 
 |----------|----------|-------------|
 | `ansible_host` | yes | SSH target IP or hostname |
 | `ansible_user` | yes | SSH user (commonly `root` on bare-metal) |
-| `k7_backends` | yes | Comma-separated list of backends supported by this node. Values: `kata-qemu-longhorn`, `kata-firecracker-devmapper`, `k7d` |
+| `k7_backends` | yes | Comma-separated list of backends supported by this node. Values: `kata-qemu-longhorn` (`kql`), `kata-firecracker-devmapper` (`kfd`), `k7d`, `k7d-fc` (`k7-fc`) |
 | `k7_devmapper_disk` | for `kata-firecracker-devmapper` | **Raw, unformatted** block device for the LVM thin-pool (e.g. `/dev/nvme1n1`). Usually better left unset — the playbook auto-detects (see note above). Wipe with `utils/wipe-disk.sh` first. On dual-NVMe (`TWO_DISK`) boxes **omit this** so a swapped `nvme0n1`/`nvme1n1` cannot point at the OS disk. |
 | `longhorn_extra_disk` | optional, `kata-qemu-longhorn` only | Existing **mount path** (e.g. `/mnt/longhorn-extra`) to register as an extra Longhorn disk. **Not** a `/dev/...` device — format and mount it yourself first. Without this, Longhorn uses `longhorn_data_path` (default `/var/lib/longhorn`) on the root filesystem. |
 | `kata_thinpool_pv_size` | optional, `kata-firecracker-devmapper` only | LVM PV size for the kfd thin-pool (default `100G`) |

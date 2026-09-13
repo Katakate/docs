@@ -62,8 +62,10 @@ Fields accepted in the JSON body when creating a sandbox:
 
 - `name` (string, required): Unique sandbox name in the namespace
 - `image` (string, required): Container image, e.g. `alpine:latest`. Registry host must be public and allowlisted (`registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`; extend with `K7_REGISTRY_ALLOWLIST`)
-- `backend` (string | null): `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), or `k7d`. Auto-detected when omitted
-- `sidecar` (string | null): Sidecar type, e.g. `docker`
+- `backend` (string | null): `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), `k7d`, or `k7d-fc`. Auto-detected when omitted
+- `docker` (boolean, default `false`): Run a pinned `dockerd` inside the sandbox with `overlay2` on a block graph disk. On `k7d` / `k7d-fc` it is an in-guest agent service and the sandbox stays forkable; on `kfd` / `kql` a privileged `docker-vehicle` container is injected. See [Docker in a sandbox](/k7/guides/docker)
+- `docker_disk` (string | null, default `20Gi`): Graph disk size for `docker: true`
+- `sidecar` (string | null): Deprecated — `"docker"` is an alias of `docker: true`
 - `root_disk_size` (string, default `10Gi`): Longhorn root PVC size (`kql` only)
 - `namespace` (string, default `default`): Kubernetes namespace
 - `env_file` (string | null): Path (on API host) to `.env` file to inject as Secret
@@ -71,6 +73,10 @@ Fields accepted in the JSON body when creating a sandbox:
 - `entrypoint` / `cmd` (string[] | null): Override image ENTRYPOINT / CMD
 - `limits` (object): Resource limits/requests; keys supported: `cpu`, `memory`, `ephemeral-storage`
 - `egress_whitelist` (string[] | [] | null): omit / `null` = open; `[]` = block-all; listed CIDRs or FQDNs = allowlist. See [Networking](/k7/concepts/networking)
+- `ingress_ports` (int[] | null): TCP ports to open for inbound traffic. Omit / `[]` = deny all ingress (default)
+- `ingress_from` (string[] | null): Who may reach `ingress_ports` — `sandbox:<name>`, `namespace:<ns>`, or `cidr:<cidr>`. Omitted with ports set = sandboxes in the same namespace, never the world. Any other entry, or `ingress_from` without `ingress_ports`, is `400`
+- `expose_ports` (int[] | null): Publish these ports outside the cluster through a `NodePort` Service `{name}-expose` (`externalTrafficPolicy: Local`). Each must also appear in `ingress_ports`; otherwise `400`. Allocated NodePorts are returned as `node_ports` on list / get
+- `volumes` (object[] | null): hostPath / PVC volume entries. Refused with `400` on `k7d-fc`
 - `pod_non_root` (boolean, default false): Run pod as non-root (UID/GID/FSGroup 65532)
 - `container_non_root` (boolean, default false): Run container as non-root (UID 65532)
 - `cap_drop` (string[] | null): List of capabilities to drop; default policy is `ALL`
@@ -83,6 +89,8 @@ Fields accepted in the JSON body when creating a sandbox:
 ```json
 { "data": { "name": "my-sandbox", "namespace": "default", "image": "alpine:latest" } }
 ```
+
+When `expose_ports` is set the body also carries `endpoints: [{ "port", "node_port", "url" }]` — the resolved `http://<node-ip>:<nodeport>` for each exposed port.
 
 - `400 BadRequest` when validation fails (invalid limits, bad env file, already exists, etc.)
 
@@ -99,7 +107,7 @@ curl -H "X-API-Key: $K7_API_KEY" "$BASE/api/v1/sandboxes?namespace=default"
 ```
 </RequestExample>
 
-Returns list of sandbox objects with fields: name, namespace, status, ready, restarts, age, image, backend, node, error_message.
+Returns list of sandbox objects with fields: name, namespace, status, ready, restarts, age, image, backend, node, node_ports, error_message. `node_ports` lists the NodePorts allocated by `expose_ports` (empty when the sandbox is not exposed).
 
 <ResponseExample>
 ```json Success
@@ -113,6 +121,9 @@ Returns list of sandbox objects with fields: name, namespace, status, ready, res
       "restarts": 0,
       "age": "0:05:42",
       "image": "alpine:latest",
+      "backend": "k7d",
+      "node": "k7-node-01",
+      "node_ports": [],
       "error_message": ""
     }
   ]
@@ -235,7 +246,8 @@ Responses:
 Endpoint: `POST /api/v1/sandboxes/{name}/pause`
 
 On **kql**, scales the sandbox Deployment to 0 and optionally creates a Longhorn
-`VolumeSnapshot` of its root PVC. On **k7d**, freezes the live VM in place
+`VolumeSnapshot` of its root PVC (and of the `<name>-docker-lh` graph PVC for a
+`docker: true` sandbox). On **k7d** / **k7d-fc**, freezes the live VM in place
 (memory survives). `--snapshot` / the `snapshot` body field is kata-qemu-longhorn-only.
 
 <ParamField path="name" type="string" required>Sandbox name</ParamField>
@@ -302,9 +314,12 @@ Endpoint: `POST /api/v1/sandboxes/{name}/fork`
 
 Clones a sandbox into a new name. **kql**: disk-only clone from a
 `VolumeSnapshot` of the source's root PVC (~45 s single-node; longer with
-replicas ≥ 2). **k7d**: warm CoW fork of disk **and** memory (~2–4 s to a
-Ready pod; child inherits running processes). **kfd**: returns 400. The
-request blocks until the new sandbox is usable.
+replicas ≥ 2). **k7d** / **k7d-fc**: warm CoW fork of disk **and** memory (~2–4 s to a
+Ready pod; child inherits running processes, including a live `docker: true`
+engine). **kfd**: returns 400 (also for `docker: true` on any backend whose
+graph disk cannot be cloned). The fork inherits the source's egress and
+ingress policy but not its `expose_ports` Service. The request blocks until
+the new sandbox is usable.
 
 <ParamField path="name" type="string" required>Source sandbox name</ParamField>
 
@@ -351,6 +366,7 @@ Responses:
 
 ## See also
 
-- API Security & networking: `/api/security`
+- [Security & networking](/k7/api/security)
+- [Docker in a sandbox](/k7/guides/docker)
 
 

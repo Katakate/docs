@@ -7,6 +7,10 @@ Fork removes the cost of *starting* an episode. Most of what is left in a Kubern
 
 k7d already owns the guest clock end to end (`kvm-clock`, no RTC, no NTP client, `KVM_SET_CLOCK` on every restore), so the same pause that makes a fork correct can also move every member's clock by the same delta. Two mechanisms, one rule: **forward only, lockstep only, whole-cluster pause or nothing** — a declined warp is always correct.
 
+<Note>
+Time warp is a native-engine feature. `backend: firecracker` / `runtimeClassName: k7-fc` VMs reject `dilation > 1` and warp requests with a named error — see [Backends](/k7d/concepts/backends).
+</Note>
+
 ## The numbers
 
 An 8.7-minute guest-time episode on a 3-node Ubuntu k3s cluster:

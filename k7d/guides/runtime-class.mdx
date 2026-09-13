@@ -1,9 +1,9 @@
 ---
-title: "RuntimeClass k7"
-description: "Run Kubernetes pods as k7d microVMs: daemon, shim, containerd config, RuntimeClass"
+title: "RuntimeClass k7 and k7-fc"
+description: "Run Kubernetes pods as k7d microVMs: daemon, shim, containerd config, RuntimeClass, and the Firecracker-backed k7-fc class"
 ---
 
-k7d plugs into Kubernetes as a containerd runtime: pods with `runtimeClassName: k7` run inside k7d microVMs instead of plain containers. Four steps register the runtime on a k3s node.
+k7d plugs into Kubernetes as a containerd runtime: pods with `runtimeClassName: k7` run inside k7d microVMs instead of plain containers, and pods with `runtimeClassName: k7-fc` run the same guest under a stock Firecracker jail (see [Backends](/k7d/concepts/backends)). Four steps register the runtime on a k3s node.
 
 <Note>
 The release [installer](/k7d/getting-started/installation) does all four steps for you: `sudo ./install.sh --with-k3s`. The manual steps below are for understanding what it does, or for non-k3s containerd setups.
@@ -15,7 +15,7 @@ The release [installer](/k7d/getting-started/installation) does all four steps f
 The shim is a thin client: sandbox `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly if it is not running.
 
 ```bash
-cd dist/k7d-v0.4.0-x86_64-linux     # or the extracted release tarball
+cd dist/k7d-v0.6.0-x86_64-linux     # or the extracted release tarball
 cp k7d /usr/local/bin/
 mkdir -p /usr/local/share/k7d /opt/k7d
 cp vmlinux initramfs.cpio.gz /usr/local/share/k7d/
@@ -64,7 +64,24 @@ Add to `/var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl`:
 Two things matter here:
 
 - `pod_annotations` forwards the `k7d.katakate.org/*` pod annotations (`cluster-id`, `fork-vm-index`, …) into the sandbox OCI spec so the shim can see them — required for cluster-mode pods deployed via kubectl.
-- Do **not** add an `[options]` section with `BinaryName` — the option value leaks into the cgroup path and breaks shim startup.
+- Do **not** add `BinaryName` under `[options]` — the option value leaks into the cgroup path and breaks shim startup.
+
+To also offer the Firecracker engine, add a second runtime that points the same shim at a config file selecting the backend (the k3s CRI does not stamp `io.kubernetes.cri.runtime-handler`, so the shim cannot tell the two handlers apart any other way):
+
+```toml
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc]
+  runtime_type = "io.containerd.k7.v1"
+  pod_annotations = ["k7d.katakate.org/*"]
+  privileged_without_host_devices = true
+  snapshotter = "overlayfs"
+  [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.k7-fc.options]
+    ConfigPath = "/etc/k7d/shim-k7-fc.toml"
+```
+
+```bash
+mkdir -p /etc/k7d && echo 'backend = "firecracker"' > /etc/k7d/shim-k7-fc.toml
+bash utils/install-firecracker.sh     # pinned firecracker + jailer, sha-verified
+```
 
 </Step>
 <Step title="Restart k3s and create the RuntimeClass">
@@ -80,7 +97,23 @@ handler: k7
 EOF
 ```
 
-Verify with `kubectl get runtimeclass k7` — it should show `HANDLER: k7`.
+For `k7-fc`, add a RuntimeClass with the measured [PodOverhead](https://github.com/Katakate/k7d/blob/main/OVERHEAD.md) so kubelet accounts for the out-of-process VMM:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: k7-fc
+handler: k7-fc
+overhead:
+  podFixed:
+    cpu: 50m
+    memory: 32Mi
+EOF
+```
+
+Verify with `kubectl get runtimeclass k7 k7-fc` — handlers `k7` and `k7-fc`.
 
 </Step>
 </Steps>
@@ -100,11 +133,24 @@ spec:
       command: ["sleep", "infinity"]
 ```
 
-`kubectl logs`, `kubectl exec` (including `-it` with PTY, resize, Ctrl-C, detach), pod IPs, Services, DNS, ConfigMaps/Secrets, emptyDir/hostPath/PVC volumes, memory/CPU limits, init containers, natural exit / `restartPolicy`, and multi-vCPU guests all work — see the [feature matrix](/k7d/guides/feature-matrix) for the full support table and what's still to come (`hostNetwork`, NetworkPolicy, IPv6, cross-node fork).
+`kubectl logs`, `kubectl exec` (including `-it` with PTY, resize, Ctrl-C, detach), pod IPs, Services, DNS, ConfigMaps/Secrets, emptyDir/hostPath/PVC volumes, memory/CPU limits, init containers, natural exit / `restartPolicy`, and multi-vCPU guests all work — see the [feature matrix](/k7d/guides/feature-matrix) for the full support table and what's still to come (`hostNetwork`, NetworkPolicy, IPv6, cross-node fork). Swap in `runtimeClassName: k7-fc` for the Firecracker engine; everything above works there too except hostPath / virtiofs volumes and time warp, which fail Create with a named error.
+
+The pod's `securityContext` is honoured inside the VM: seccomp profiles, `maskedPaths` / `readonlyPaths`, device cgroups, capabilities and `noNewPrivileges` are passed through to the guest `runc` unchanged — see [Security](/k7d/concepts/security#pod-securitycontext-reaches-guest-runc).
 
 <Note>
 **CPU limits and vCPUs:** the shim derives the guest's vCPU count from the pod's CPU limit (`cpu: "2"` boots a 2-vCPU guest), and the limit is additionally enforced on the host via a CFS quota on the VM's vCPU threads. Fork and snapshot preserve multi-vCPU state.
 </Note>
+
+## Docker inside the pod
+
+```yaml
+metadata:
+  annotations:
+    k7d.katakate.org/docker: "true"
+    k7d.katakate.org/docker-disk: 40Gi     # optional, default 20Gi
+```
+
+The guest agent (PID 1) supervises a pinned `dockerd` (27.5.1, with Compose and Buildx on `PATH`) whose `overlay2` graph lives on a dedicated per-VM virtio-blk scratch disk; the binaries come from a read-only, host-enforced payload slot at `/run/k7d/docker-tools`. Nothing is added to the pod spec and no container is privileged. Because it is a guest service rather than a CRI sidecar, a warm fork keeps `dockerd` and its running containers (the child's graph disk is a reflink). Any value other than `"true"`, or `docker-disk` without `docker`, fails Create. `docker.sock` is guest root — read [Docker as a guest service](/k7d/concepts/security#docker-as-a-guest-service) before enabling it for untrusted workloads, and prefer `k7-fc` for multi-tenant use. K7 exposes this as [`k7 create --docker`](/k7/guides/docker).
 
 ## Sizing writable storage
 
@@ -151,12 +197,18 @@ Each `id:size:guest-mount` entry attaches an ext4 image `data/<id>.img` on the d
 
 | Annotation | Value | Meaning |
 |---|---|---|
+| `k7d.katakate.org/backend` | `native` \| `firecracker` | Which VMM boots the pod. `k7-fc` pods are Firecracker regardless; `native` on `k7-fc` is a Create error (`contradicts`) |
+| `k7d.katakate.org/docker` / `docker-disk` | `"true"` / quantity | Agent-supervised in-guest dockerd with an `overlay2` graph disk (default 20Gi) |
 | `k7d.katakate.org/scratch-size` | quantity (`8Gi`) | Pod-wide writable scratch disk. Default 8 GiB |
 | `k7d.katakate.org/container-scratch-size` | `name=size,…` | Own writable image per named container |
 | `k7d.katakate.org/data-disks` | `id:size:mount,…` | Named persistent disks |
-| `k7d.katakate.org/image-slots` / `image-slot-size` | count / quantity | Spare virtio-blk slots (default 4 × 2 GiB, sparse) for images assigned after boot — later containers of the pod mount their rootfs without a VM restart |
+| `k7d.katakate.org/image-slots` / `image-slot-size` | count / quantity | Spare virtio-blk slots (default 2 × 2 GiB, sparse) for images assigned after boot — later containers of the pod mount their rootfs without a VM restart. The default dropped from 4 to 2 to leave virtio-MMIO room for the Docker payload + graph pair or several hostPath disks |
 | `k7d.katakate.org/cluster-id` | string | Put this pod's VM on the shared bridge `k7-br-<id>` with a stable `10.200.0.{2+index}` identity — the [cluster mode](/k7d/guides/cluster-mode) adopt path |
 | `k7d.katakate.org/fork-source-cluster` / `fork-source-vm` / `fork-vm-index` | strings | Boot this pod as a warm **fork** of a live sandbox VM instead of cold-booting: the fork adopts the container already running inside the forked guest. The source keeps its vsock CID |
+| `k7d.katakate.org/tree-id` / `tree-source-node-id` | strings | Record which named [snapshot tree](/k7d/concepts/snapshot-tree) this cluster belongs to (and, for a fork, which tree node it came from) |
+| `k7d.katakate.org/tree-adopt-cluster` | cluster-id | On sandbox Create, adopt the live VMs sharing that `cluster-id` as the root of tree `tree-id` (`TreeAdoptCluster`). Requires `tree-id`; the trigger pod must not be a member itself |
+| `k7d.katakate.org/tree-fork-from` + `tree-fork-label` | node id + label | Fork tree `tree-id` from that node under the given branch label (`TreeFork`). Both or neither; runs after the adopt when combined |
+| `k7d.katakate.org/tree-budget` | JSON `TreeBudget` | Optional adopt budget override (the daemon default is sized for 256 MiB busybox guests); rejected without `tree-adopt-cluster` |
 
 All values fail loud on a malformed entry — a pod that asked for a disk and silently did not get one would lose its data with the VM, which is the failure the annotations exist to prevent.
 

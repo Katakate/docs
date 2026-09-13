@@ -22,7 +22,7 @@ The async client raises `RuntimeError` at construction time if `httpx` isn't ins
 ```python
 from k7_sdk import Client
 
-k7 = Client(endpoint="http://node:31007", api_key="<your-key>")
+k7 = Client(endpoint="https://node:31007", api_key="<your-key>", verify_ssl="./k7-ca.crt")
 
 sb = k7.create({
     "name": "demo",
@@ -35,13 +35,13 @@ print(k7.list())
 sb.delete()
 ```
 
-Discover the endpoint with `k7 api endpoint` and the key with `k7 generate-api-key <name>`. See the [CLI guide](/k7/guides/cli) for full details.
+Discover the endpoint with `k7 api endpoint` and the key with `k7 generate-api-key <name>`. On the default install the API presents a certificate signed by the cluster CA (`/etc/k7/tls/ca.crt` on the node) — copy it to the client and pass its path as `verify_ssl`. Clusters installed with `--api-hostname` (Let's Encrypt) work with the default `verify_ssl=True`. See the [CLI guide](/k7/guides/cli) for full details.
 
 ## `Client` reference
 
 | Method | Returns | Notes |
 |--------|---------|-------|
-| `Client(endpoint, api_key, verify_ssl=True)` | — | TLS verify is on by default. Set `verify_ssl=False` only for self-signed dev clusters. |
+| `Client(endpoint, api_key, verify_ssl=True)` | — | `verify_ssl` is `True` (system trust store) or a **CA bundle path** (cluster CA). `verify_ssl=False` raises `ValueError` on an `https://` URL — there is no insecure mode; use `http://` only against a `--api-insecure-http` install. |
 | `create(config: dict)` | `SandboxProxy` | `config` matches [`SandboxConfig`](/k7/api/endpoints/sandboxes#request-body-schema). |
 | `list(namespace=None)` | `list[dict]` | Omit `namespace` to list all. |
 | `delete(name, namespace="default")` | `dict` | |
@@ -50,10 +50,12 @@ Discover the endpoint with `k7 api endpoint` and the key with `k7 generate-api-k
 | `install(playbook=None, inventory=None, verbose=False)` | `dict` | Trigger an Ansible run via the API. Useful for joining new nodes. |
 | `pause(name, snapshot=None, namespace=...)` | `dict` | Scale to 0; optional VolumeSnapshot name |
 | `resume(name, namespace=...)` | `dict` | Scale back to 1 |
-| `fork(source, new_name, namespace=..., snapshot=None)` | `SandboxProxy` | kql: disk clone + cold boot; k7d: warm CoW fork (memory + disk) |
+| `fork(source, new_name, namespace=..., snapshot=None)` | `SandboxProxy` | kql: disk clone + cold boot; k7d / k7d-fc: warm CoW fork (memory + disk) |
 | `restore(snapshot, new_name, overrides=None, keep_snapshot=True)` | `SandboxProxy` | New sandbox from a snapshot |
-| `list_snapshots(...)` / `delete_snapshot(...)` / `gc_snapshots(...)` | varies | Snapshot lifecycle (see [Snapshots API](/k7/api/endpoints/snapshots)) |
-| `nodes_storage()` | `dict` | Per-node kfd thin-pool + k7d disk-pool utilization (see [Nodes API](/k7/api/endpoints/nodes)) |
+| `list_snapshots(...)` / `get_snapshot(...)` / `create_snapshot(...)` / `delete_snapshot(...)` / `gc_snapshots(...)` | varies | Snapshot lifecycle (see [Snapshots API](/k7/api/endpoints/snapshots)) |
+| `exec(name, command, namespace="default")` | `dict` | Run a command without a proxy |
+| `logs(name, tail=200, container="sandbox", since=0, namespace=...)` | `str` | Snapshot of the pod logs |
+| `nodes_storage()` | `dict` | Per-node kfd thin-pool + k7d disk-pool utilization (see [Nodes API](/k7/api/endpoints/nodes)). Unscoped keys only (`403` for namespace-scoped keys) |
 
 `SandboxProxy` (returned by `create`) exposes:
 
@@ -61,6 +63,7 @@ Discover the endpoint with `k7 api endpoint` and the key with `k7 generate-api-k
 - `delete() -> dict` — shorthand for `client.delete(name, namespace)`
 - `pause` / `resume` / `fork` — same as the client methods, scoped to this sandbox
 - `snapshot(name)` — named VolumeSnapshot without pausing
+- `logs(tail=200, container="sandbox", since=0)` — log snapshot
 
 The proxy keeps a reference to the `Client`, so calling `sb.exec(...)` after the parent client closes will raise.
 
@@ -75,11 +78,12 @@ sb = k7.create({
     "namespace": "default",
 
     # Backend selection
-    "backend": "kata-qemu-longhorn",      # or "kata-firecracker-devmapper" / "k7d"
+    "backend": "kata-qemu-longhorn",      # or "kata-firecracker-devmapper" / "k7d" / "k7d-fc"
     "root_disk_size": "20Gi",        # kata-qemu-longhorn only
 
-    # Sidecar (Docker-in-VM)
-    "sidecar": "docker",
+    # Docker inside the sandbox (pinned dockerd, overlay2 on a block disk)
+    "docker": True,
+    "docker_disk": "40Gi",           # default 20Gi
 
     # Non-root + minimal capabilities
     "pod_non_root": True,
@@ -88,6 +92,11 @@ sb = k7.create({
 
     # FQDN-aware egress (Cilium); falls back to CIDR if all entries are CIDRs
     "egress_whitelist": ["api.openai.com", "*.huggingface.co"],
+
+    # Ingress is deny-all unless you open ports; scope callers; optionally publish
+    "ingress_ports": [8000],
+    "ingress_from": ["sandbox:frontend"],   # or "namespace:<ns>" / "cidr:<cidr>"
+    # "expose_ports": [8000],               # NodePort; node_ports comes back on list()
 
     # Resource budget
     "limits": {"cpu": "1", "memory": "1Gi", "ephemeral-storage": "2Gi"},
@@ -130,8 +139,10 @@ wait_until_ready(k7, "secure-sb")
 
 `pause`, `resume`, and `fork` work on `Client` and on the `SandboxProxy` from `create`. Behavior depends on the backend:
 
-- **`kata-qemu-longhorn`** — fork clones the root disk via Longhorn `VolumeSnapshot` (the fork cold-boots, ~45 s); pause/resume scale the Deployment and the PVC survives.
-- **`k7d`** — fork is a warm CoW copy of the whole VM (memory + disk + processes, ~5 ms at the VMM, ~2 s end-to-end to a Ready pod); pause/resume freeze and thaw the live VM in place. Works for sandboxes on any node — the API forwards to the per-node `k7-agent` when needed.
+- **`kata-qemu-longhorn`** — fork clones the root disk via Longhorn `VolumeSnapshot` (the fork cold-boots, ~45 s); pause/resume scale the Deployment and the PVC survives. A `docker: True` sandbox's graph PVC is cloned too.
+- **`k7d`** / **`k7d-fc`** — fork is a warm CoW copy of the whole VM (memory + disk + processes — including a live `docker: True` engine, ~5 ms at the VMM, ~2 s end-to-end to a Ready pod); pause/resume freeze and thaw the live VM in place. Works for sandboxes on any node — the API forwards to the per-node `k7-agent` when needed.
+
+Forks inherit the source's egress and ingress policy, but not its `expose_ports` Service.
 
 ```python
 base = k7.create({
@@ -180,7 +191,7 @@ import asyncio
 from k7_sdk import AsyncClient
 
 async def main():
-    k7 = AsyncClient(endpoint="http://node:31007", api_key="<your-key>")
+    k7 = AsyncClient(endpoint="https://node:31007", api_key="<your-key>", verify_ssl="./k7-ca.crt")
     try:
         await k7.create({"name": "async-sb", "image": "alpine:latest"})
 
@@ -224,7 +235,7 @@ async def run_one(k7, idx):
         await k7.delete(name)
 
 async def main():
-    k7 = AsyncClient(endpoint="http://node:31007", api_key="<your-key>")
+    k7 = AsyncClient(endpoint="https://node:31007", api_key="<your-key>", verify_ssl="./k7-ca.crt")
     try:
         results = await asyncio.gather(*[run_one(k7, i) for i in range(10)])
         print(results)

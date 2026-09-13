@@ -1,6 +1,6 @@
 ---
 title: "Networking"
-description: "Cilium, ingress isolation, and FQDN-aware egress whitelists"
+description: "Cilium, platform isolation, opt-in ingress and NodePort exposure, FQDN-aware egress whitelists, Hubble"
 ---
 
 Katakate gives every sandbox its own VM-level network namespace and applies opinionated network policies on top. This page explains the model.
@@ -19,14 +19,64 @@ k7 install --cni flannel
 
 When the cluster is on Cilium, k7 uses **`CiliumNetworkPolicy`** for FQDN egress. On Flannel it falls back to the standard Kubernetes **`NetworkPolicy`** with CIDR-only `ipBlock` rules.
 
-## Ingress isolation (always on)
+## Sandboxes never reach the platform (always on, Cilium)
 
-A `NetworkPolicy` blocks **all inter-VM ingress traffic by default**. Practical implications:
+A cluster-wide, deny-only `CiliumClusterwideNetworkPolicy` named **`k7-sandbox-platform-deny`** is installed by `k7 install`. It stops every sandbox — in **every** egress mode, including `--egress-open` — from reaching:
 
-- **Sandbox-to-sandbox networking is denied** — even within the same namespace.
+- the node it runs on and the other nodes (SSH, kubelet, k3s ports),
+- the Kubernetes API server (`10.43.0.1:443`),
+- link-local / cloud metadata (`169.254.0.0/16`),
+- the `kube-system` and `longhorn-system` pods — `k7-api`, `k7-agent`, Longhorn — **except CoreDNS**, which stays reachable so FQDN egress keeps working.
+
+It is deny-only (`enableDefaultDeny: false`), so it never narrows what a whitelist allows beyond those targets, and it cannot turn an open sandbox into a default-deny one. **Cilium-only:** `--cni flannel` clusters do not get this isolation.
+
+## Ingress: denied by default, opt-in per sandbox
+
+Every sandbox gets a deny-all `{name}-deny-ingress` `NetworkPolicy`. Practical implications:
+
+- **Sandbox-to-sandbox networking is denied** — even within the same namespace — until you open a port.
 - **`kubectl exec` and `k7 shell` still work** — they go through the Kubernetes API, not pod networking.
 - **`kube-system` traffic is allowed** — needed for cluster services (DNS, metrics, etc.).
-- **No configuration required** — this is enforced for every sandbox.
+
+To accept connections, open TCP ports and say who may connect:
+
+| Setting | CLI | YAML / API | Result |
+|---|---|---|---|
+| **deny-all** (default) | `k7 create …` (no ingress flag) | omit `ingress_ports` | deny-all ingress NetworkPolicy |
+| **open TCP ports** | `--ingress-port <port>` (repeatable) | `ingress_ports: [<ports>]` | listed ports reachable from sandboxes in the **same namespace** |
+| **scope the sources** | `--ingress-from <source>` (repeatable) | `ingress_from: [<sources>]` | only the listed sources reach those ports |
+
+Sources:
+
+| Entry | Matches |
+|---|---|
+| `sandbox:<name>` | that sandbox, same namespace (`podSelector` on `katakate.org/sandbox`) |
+| `namespace:<ns>` | every pod in that namespace (`namespaceSelector` on `kubernetes.io/metadata.name`) |
+| `cidr:<cidr>` | clients in that CIDR (`ipBlock`) |
+
+Anything else is a hard error at create time. `--ingress-from` without `--ingress-port` is an error too: sources alone open nothing. `--ingress-port` with no `--ingress-from` means "other sandboxes in this namespace", **never the world** — reaching a sandbox from anywhere requires `--ingress-from cidr:0.0.0.0/0`, typed out in full. These are stock v1 `NetworkPolicy` rules, so ingress works on `--cni flannel` as well.
+
+<Warning>
+**`cidr:` does not scope in-cluster peers on Cilium.** Cilium does not evaluate an `ipBlock` peer when both ends are Cilium-managed pods, so a rule whose peers are all `cidr:` degrades to a *port-only* allow inside the cluster — the port answers **any sandbox in the cluster**, even when the CIDR contains no cluster IP. `k7 create` warns on stderr whenever `--ingress-from` contains a `cidr:` entry. Use `cidr:` for **external** clients (that is what `--expose-port` needs it for) and `sandbox:` / `namespace:` to scope in-cluster access — those are evaluated by pod identity.
+</Warning>
+
+A sandbox is a bare Deployment with no Service, so ingress rules only cover in-cluster traffic. To reach a sandbox from outside the cluster, expose it.
+
+## Exposing a sandbox outside the cluster
+
+`--expose-port <port>` (repeatable; `expose_ports` in YAML / API) creates a `NodePort` Service named `{name}-expose` in the sandbox's namespace. `k7 create` prints the resolved `http://<node-ip>:<nodeport>` for each port, and `k7 list` shows the allocated NodePorts.
+
+```bash
+k7 create web python:3.12-slim \
+  --ingress-port 8000 --ingress-from cidr:203.0.113.0/24 --expose-port 8000
+# 🌐 Port 8000 exposed at http://<node-ip>:31234
+```
+
+- **Every `--expose-port` needs a matching `--ingress-port`.** k7 refuses otherwise: a public NodePort in front of a deny-all policy is a confusing no-op, and one in front of an accidentally-open policy is a breach.
+- The Service uses `externalTrafficPolicy: Local`, so the client's real source IP reaches the pod and `--ingress-from cidr:…` rules mean something. Consequence: the NodePort **only answers on the node running the sandbox** (`k7 list` shows which one).
+- A `cidr:` allowlist does not constrain clients on the cluster's own nodes; verify it from a genuinely external client — `curl` from a node passes no matter how the rule is written.
+- On a bare-metal host the node IP is public, so `--expose-port` with `--ingress-from cidr:0.0.0.0/0` publishes an untrusted sandbox to the internet. k7 warns on stderr on every such create.
+- `k7 delete` removes the Service. A `k7 fork` inherits the source's ingress and egress **policy** but not its Service — a fork is not reachable from outside until you expose it.
 
 ## Egress control
 
@@ -98,16 +148,44 @@ If the whitelist is `[]` or contains only CIDRs, DNS resolution is **denied** by
 
 For each sandbox, k7 creates:
 
-1. An **ingress-deny** `NetworkPolicy` (always).
+1. A **`{name}-deny-ingress`** `NetworkPolicy` (always; `--ingress-port` adds allow rules to this same object).
 2. **Either**:
    - A `NetworkPolicy` with CIDR-only `ipBlock` egress rules (when only CIDRs are listed, **or** the cluster runs Flannel), **or**
    - A `CiliumNetworkPolicy` for FQDN+CIDR egress (when FQDNs are present and Cilium is installed).
+3. A `{name}-expose` `NodePort` Service, only with `--expose-port`.
 
-All policies are deleted with the sandbox.
+On top of these, the cluster-wide `k7-sandbox-platform-deny` policy applies to every sandbox. All per-sandbox objects are deleted with the sandbox. A `k7 fork` inherits the source's ingress and egress configuration and is rolled back if its policies cannot be created — a fork of a locked-down sandbox never comes up open.
 
 ## Administrative access
 
 `kubectl exec`, `k7 shell`, the API's `/exec` endpoint, and `k7 logs` all bypass network policies because they ride the Kubernetes API. Pod networking restrictions never affect operator access.
+
+## Restricting who can reach `k7-api`
+
+`k7-api` is a `NodePort` Service on `31007`, served over HTTPS by default (see [Security model](/k7/concepts/security-model#api-transport-tls)). On a dedicated box the node IP is public. `k7 install --api-allow-cidr 203.0.113.4/32 --api-allow-cidr 198.51.100.0/24` (repeatable, Cilium only — `--cni flannel` fails at the CLI) renders a `CiliumNetworkPolicy` `k7-api-ingress` on the API pod and flips the Service to `externalTrafficPolicy: Local` so the pod sees the real client IP. Both are skipped entirely when the flag is unset, which is the default.
+
+This is defence in depth for operators who know their client CIDRs; it stacks with TLS and does not replace it. Things worth knowing before you debug it:
+
+- With `Local`, the NodePort answers **only** on the node running the `k7-api` pod — the first master, which is the address the playbook writes into `/etc/k7/api_endpoint`.
+- **A curl from a node is not a test of the allowlist.** Node-local traffic matches Cilium's `host` entity and is SNAT'd to the pod network, so it succeeds however wrong the CIDR list is. Test from off-cluster.
+- A wrong CIDR only costs API access: the policy selects the `k7-api` pod endpoint, never the host, so SSH, `kubectl`, and on-node `k7 --core` keep working.
+- Rollback: re-run `k7 install` without the flag, or delete `ciliumnetworkpolicy/k7-api-ingress` in `kube-system` and patch the Service back to `externalTrafficPolicy: Cluster`.
+
+## Debugging policy drops (Hubble)
+
+Hubble is **opt-in observability**, not enforcement — off by default, not a security control. Enable it with `k7 install --hubble` (Cilium only; `--hubble --cni flannel` fails loudly). It installs Hubble Relay and a pinned `hubble` CLI; the Hubble UI is **not** installed (no authentication, public node IP). Rollback: `cilium hubble disable`.
+
+```bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+cilium hubble port-forward &     # kube-system/hubble-relay → 127.0.0.1:4245
+hubble status
+hubble observe --verdict DROPPED --last 50
+hubble observe --namespace <ns> --verdict DROPPED --last 50
+cilium fqdn cache list           # what Cilium learned for FQDN rules
+cilium ip list                   # which IPs carry an fqdn: identity
+```
+
+When a sandbox with an FQDN whitelist cannot reach a host, the symptom is always a hang — policy drop, DNS, MTU, and a dead upstream look the same from inside the VM. A `Policy denied DROPPED` verdict with the destination still labelled `world` means the FQDN→identity mapping missed (wildcard too narrow, or the learned IP expired).
 
 ## Multi-node considerations
 

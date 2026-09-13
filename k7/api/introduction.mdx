@@ -3,7 +3,11 @@ title: "Auth & responses"
 description: "Authentication, base URL, and response format"
 ---
 
-Base URL: `https://<your-endpoint>` (see `k7 api status` / `k7 api endpoint`).
+Base URL: `https://<first-master-ip>:31007` (see `k7 api status` / `k7 api endpoint`).
+
+## Transport
+
+The NodePort is served over **HTTPS** by default. On the default install the certificate is signed by a playbook-minted cluster CA at `/etc/k7/tls/ca.crt` on the node — copy it to your client and trust it (`curl --cacert ca.crt …`, `Client(..., verify_ssl="ca.crt")`, `k7 config set api.ca ca.crt`). Clusters installed with `--api-hostname` present a Let's Encrypt certificate; `--api-tls-cert/--api-tls-key` an operator-supplied one; `--api-insecure-http` serves plain `http://`. Disabling verification on an `https://` URL is rejected by the CLI and SDK. See [Security model](/k7/concepts/security-model#api-transport-tls).
 
 ## Authentication
 
@@ -15,7 +19,7 @@ X-API-Key: <your-key>
 Authorization: Bearer <your-key>
 ```
 
-All endpoints return standard HTTP codes. `401 Unauthorized` if the key is missing/invalid/expired. `403 Forbidden` if a **namespace-scoped** key is used against another namespace or an all-namespaces operation. Keys created with `k7 generate-api-key NAME -n <ns>` are scoped; omit `-n` for unrestricted access.
+All endpoints return standard HTTP codes. `401 Unauthorized` if the key is missing/invalid/expired. `403 Forbidden` if a **namespace-scoped** key is used against another namespace, an all-namespaces operation, or a cluster-scoped read such as `GET /api/v1/nodes/storage`. Keys created with `k7 generate-api-key NAME -n <ns>` are scoped; omit `-n` for unrestricted access.
 
 ## Response envelope
 
@@ -76,7 +80,7 @@ Authorization: Bearer <your-key>
 | GET    | `/api/v1/sandboxes/{name}/logs`      | Snapshot of pod logs (no streaming yet) |
 | POST   | `/api/v1/sandboxes/{name}/pause`     | Scale to 0, optionally snapshot the PVC |
 | POST   | `/api/v1/sandboxes/{name}/resume`    | Scale back to 1 |
-| POST   | `/api/v1/sandboxes/{name}/fork`      | Clone source into a new sandbox (kql: disk clone; k7d: warm CoW fork) |
+| POST   | `/api/v1/sandboxes/{name}/fork`      | Clone source into a new sandbox (kql: disk clone; k7d / k7d-fc: warm CoW fork) |
 | POST   | `/api/v1/sandboxes/{name}/snapshot`  | Snapshot a running sandbox without pausing it |
 | GET    | `/api/v1/snapshots`                  | List VolumeSnapshots managed by k7 |
 | GET    | `/api/v1/snapshots/{name}`           | Inspect one VolumeSnapshot |
@@ -84,7 +88,7 @@ Authorization: Bearer <your-key>
 | POST   | `/api/v1/snapshots/{name}/restore`   | Boot a new sandbox from a standalone VolumeSnapshot |
 | POST   | `/api/v1/snapshots/gc`               | Sweep stale `kind=fork` snapshots |
 | GET    | `/api/v1/sandboxes/metrics`          | CPU/memory metrics per sandbox |
-| GET    | `/api/v1/nodes/storage`              | Per-node storage-pool utilization (kfd thin-pool + k7d disk pool) |
+| GET    | `/api/v1/nodes/storage`              | Per-node storage-pool utilization (kfd thin-pool + k7d disk pool). Unscoped keys only |
 
 <Info>
 Health endpoints:

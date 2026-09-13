@@ -14,6 +14,8 @@ Two clocks, always together: **~105 ms** to fork the minimal CI guest (a busybox
 
 k7d also owns the guest clock. An episode that is mostly *waiting* — readiness probes, backoffs, reconcile ticks — does not have to wait in wall time: lockstep clock jumps compress an 8.7-minute guest-time episode **1.83×** with zero fidelity delta, and continuous KVM time dilation runs guests at **8× wall**. See [Time warp](/k7d/guides/time-warp).
 
+Every VM boots through one daemon and one containerd shim, but you choose the engine: k7d's in-process rust-vmm VMM (`runtimeClassName: k7`, the ~5 ms `MAP_PRIVATE` fork) or a stock, sha-pinned **Firecracker** under the stock jailer (`runtimeClassName: k7-fc`) when the VMM must sit outside the daemon's address space — same guest, agent, fork/tree/pool verbs and in-guest Docker service. See [Backends](/k7d/concepts/backends).
+
 For sandboxes at scale with a CLI / API / Python SDK, see [K7](/k7/index).
 
 <CardGroup cols={2}>
@@ -41,8 +43,11 @@ JSON-lines protocol on /run/k7d/k7d.sock — every VM, tree, and clock verb.
 <Card title="Benchmarks" icon="gauge-high" href="/k7d/deep-dives/benchmarks">
 Hardware, exact commands, and every enforced latency budget — both clocks.
 </Card>
+<Card title="Backends" icon="fire" href="/k7d/concepts/backends">
+Native rust-vmm or stock Firecracker under the jailer (`k7-fc`): selection rules, feature matrix, fork mechanics.
+</Card>
 <Card title="Security model" icon="lock" href="/k7d/concepts/security">
-One daemon, many VMs; what the tree jailer (nft, cgroup, seccomp) contains and what it does not.
+One daemon, many VMs; the tree jailer (nft, cgroup, seccomp), guest-controlled path rules, the Firecracker profile, Docker as a guest service.
 </Card>
 <Card title="Formal verification" icon="shield-halved" href="/k7d/deep-dives/formal-verification">
 Kani on unsafe paths; Aeneas→Lean on the tree budget model.

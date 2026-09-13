@@ -48,4 +48,5 @@ Example response:
 
 - Pools that don't exist on a node (e.g. a `kql`-only node with no thin-pool) produce an error detail for that field.
 - A node whose `k7-agent` pod is unreachable gets a loud `{"error": ...}` entry — nodes are **never silently omitted**.
+- This is cluster-wide topology (node names, pool sizes, per-agent error strings), so it is authorized like an all-namespaces operation: a **namespace-scoped** API key receives `403 Forbidden`; unscoped keys are unchanged.
 - The same data is available via `k7 nodes storage` (`--json` for the raw payload) and `Client.nodes_storage()` in the Python SDK.

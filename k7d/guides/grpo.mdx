@@ -35,6 +35,22 @@ The agent talks JSON-lines over a Unix socket (`/run/k7d/k7d.sock`). The verbs y
 
 Full request/response shapes: [Daemon API](/k7d/api/protocol). Budget semantics and LRU eviction: [Snapshot tree](/k7d/concepts/snapshot-tree).
 
+## The gym: a lease service over cluster fork
+
+Since 0.5.0 the public tree ships [`gym/`](https://github.com/katakate/k7d/tree/main/gym) — an HTTP sidecar for one k7d daemon, Python stdlib only, no GPU, no torch. A trainer `POST /lease`s N sibling clusters forked from one live, protected checkpoint, acts on them (`/env/{id}/obs`, `/env/{id}/fork`, `/env/{id}/prepare`), scores the group (`/lease/{id}/score` returns five reward terms per member — `liveness`, `workload_ready`, `source_intact`, `contained`, `restored`), and releases. The gym owns cleanup: a client that dies costs nothing after the lease TTL, and a lease that would not fit `1 source + n forks` in the tree budget is a `400` with the arithmetic, never a silent fallback.
+
+```bash
+GYM_SOURCE_MODE=ubuntu GYM_MEMORY_MB=2048 GYM_SCOREBOARD=grpo python3 gym/server.py --port 8080
+curl -sS -X POST http://127.0.0.1:8080/lease -H 'Content-Type: application/json' \
+  -d '{"fault_id":"kill-member-0","n":4,"group_id":"g1","ttl_s":120}'
+```
+
+The trainer substrate is **Ubuntu** (a 3-node k3s cluster booted through the socket, then `tree_adopt_cluster` + `tree_protect`); `GYM_SCOREBOARD` picks `health`, `tetragon` (source-vs-branch event-stream diff), `playbook` (a 20-page SRE exam, reward = passed/turns), `incident` / `selfplay`, or `grpo` (the same fault on every member, per-member scoring). See [`gym/README.md`](https://github.com/katakate/k7d/blob/main/gym/README.md) for the HTTP contract and every knob.
+
+**Scenario packs.** With `GYM_SCENARIO_DIR` (requires `GYM_SCOREBOARD=grpo`) a lease with `fault_id: "scripted"` plus a `scenario_id` runs a fault from a directory of scenarios (`scenarios/<fault_type>/<variant>/`) instead of the built-in catalog; the lease echoes `scenario_id`, `fault_type`, `tier` and a `scenario_digest`, and tiers ≥ 1 blind the `services` / `links` observation keys. One scenario is a `scenario.yaml` (a deliberately tiny YAML subset: `id`, `fault_type`, `variant`, `tier` 0–3, `symptom`, timeouts, `obs` match rules, `hit_regex`, `wreck`, optional `decoy` and reward floors) plus four POSIX-sh scripts — `inject.sh`, `visible.sh`, `restored.sh`, `reference-fix.sh` — that run on member 0 of each fork. Validation is loud: bashisms, out-of-bound values or a missing key refuse to start the gym rather than partially load a pack, and the same validator is vendored into the `k7-scenarios` catalog so runtime and catalog cannot disagree.
+
+**Durability under fork (0.5.0).** Ubuntu TreeFork hunts now stay up across a daemon crash (`tree_open` re-opens the on-disk tree after `k7d` is `SIGKILL`ed; resume, then fork again), across a held apiserver watch and ClusterIP TCP connection through the fork, and with a Redis AOF write in flight (3 × 2 GiB fork in **575 ms**, under the 1 s ceiling).
+
 ## Three reference clients
 
 All three live in the repo's [`examples/`](https://github.com/katakate/k7d/tree/main/examples) and talk to the daemon over the socket. None is a finished SDK; each is the template for one way of driving the tree.

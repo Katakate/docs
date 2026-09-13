@@ -1,6 +1,6 @@
 ---
 title: "Security model"
-description: "What k7d isolates, what it deliberately doesn't, what the tree jailer contains, and current limitations"
+description: "What k7d isolates, what it deliberately doesn't, what the tree jailer contains, the Firecracker profile, and current limitations"
 ---
 
 k7d makes a deliberate trade-off: it optimizes for **fleets of your own environments** (RL rollouts, agent tree search, CI sandboxes), not for hostile multi-tenant isolation between forks. Read this page before deciding where to run it.
@@ -15,7 +15,7 @@ Live copy-on-write fork requires parent and child memory to be mappings **in the
 | Between unrelated trees on one host | Separate bridges (inter-tree forwarding dropped by the jail), separate guest memory files, per-tree cgroup |
 | Between sibling CoW forks of one tree | **Weaker** — parent and child share one daemon address space by design. A hypothetical daemon-level memory-safety bug could expose one fork's memory to code exploiting another |
 
-If your threat model is "mutually hostile customers on shared hardware", put tenants on separate k7d hosts (or use K7's [kata-firecracker-devmapper backend](/k7/concepts/backends)). If it is "thousands of copies of my own environment, some of which an agent will break on purpose", this design buys you the fork — and the jailer below keeps a rogue guest from reaching anything but its own bridge.
+If your threat model is "mutually hostile customers on shared hardware", run those pods on [RuntimeClass `k7-fc`](#firecracker-profile-k7-fc) — the same daemon and shim, but each VM is a stock Firecracker process in its own jail — put tenants on separate k7d hosts, or use K7's [kata-firecracker-devmapper backend](/k7/concepts/backends). If it is "thousands of copies of my own environment, some of which an agent will break on purpose", this design buys you the fork — and the jailer below keeps a rogue guest from reaching anything but its own bridge.
 
 ## The tree jailer
 
@@ -50,6 +50,50 @@ virtiofsd — used only for the read-write hostPath fallback — is spawned in `
 
 The [Ubuntu node image](/k7d/guides/ubuntu-nodes#guest-hardening) ships AppArmor profiles: the k7-agent may open `AF_VSOCK` (it is the harness's control plane); everything else, pods included, runs under a profile that denies the vsock family. The agent vsock channel is deliberately *not* jailed on the host — it is point-to-point to the host CID, and no inter-tree vsock path exists.
 
+## Guest-controlled paths
+
+The guest is attacker-controlled from its first instruction, while the shim and daemon run as host root. Every host filesystem operation whose *path* the guest can influence follows four rules:
+
+1. No `create`, `mkdir`, `open(O_CREAT)`, `rename`, `unlink`, `chown`, `copy`, or `mount` under a guest-writable directory unless the final component is opened relative to a share-root fd with `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, and an existing entry is an **error**, never reused.
+2. Anything attached to more than one VM is read-only and host-enforced (`O_RDONLY` + write requests rejected) — never "read-only because the guest mounts it `ro`".
+3. Strings from the guest agent (paths, names, sizes) never reach a host path, command line, or cgroup path. Agent responses are bounded in length.
+4. Confinement fields in the OCI spec pass through to the guest; only what the guest provably lacks is stripped.
+
+The virtiofs hostPath fallback (`/var/lib/k7d/pods/<id>/volumes-rw`) is the one guest-writable directory the host still operates under after boot: placeholders are created with `mkdirat` / `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` relative to an `O_PATH` share-root fd, bind-mounts go through `/proc/self/fd/N`, and read-only shares are `MS_RDONLY` bind-remounted before virtiofsd chroots. `K7D_DENY_VIRTIOFS_FALLBACK=1` fails Create for any pod that would take the fallback (hardened / Firecracker profiles).
+
+Named data disks are exclusive: a second sandbox asking for a disk id that is already attached is a Create error, not a shared writer.
+
+## Pod `securityContext` reaches guest runc
+
+`runtimeClassName: k7` does not weaken the confinement kubelet and containerd already encoded in the OCI spec. Guest runc sees `linux.seccomp` (including `seccompProfile: RuntimeDefault`), `maskedPaths` / `readonlyPaths`, `linux.resources.devices` exactly as CRI emitted them (deny-all for unprivileged pods, allow-all for privileged — which is what lets an in-guest kubelet open `/dev/kmsg`), capabilities, `noNewPrivileges`, and memory/CPU limits.
+
+The shim strips only what the guest kernel cannot honour: `process.apparmorProfile` (no LSM in the minimal guest), the host `cgroupsPath`, and host namespace `path`s. If guest runc rejects a seccomp profile, Create fails with runc's error — the shim never strips the profile and retries.
+
+## Control socket
+
+`/run/k7d/k7d.sock` is owned by the daemon (host root). `serve` creates the parent directory at `0750` and the socket at `0660` (`root:root`); it never tightens a world-writable sticky parent, so keep it in `/run/k7d`, not `/tmp`. A process that can connect can create, stop, and fork every VM on the node — the same power as a compromised shim. `K7D_ALLOWED_UIDS=0,1000` refuses connections from any other uid (`SO_PEERCRED`), and mutating ops (`create_vm`, `stop_vm`, `fork_vm`, tree writes, `delete_data_disk`, …) log the peer's uid/gid/pid at `info`. This is an audit trail and a floor, not an auth system.
+
+## Firecracker profile (`k7-fc`)
+
+`runtimeClassName: k7-fc` boots the same guest with the same shim, daemon and agent, but the VMM is a stock, sha-pinned Firecracker under the stock jailer instead of the in-process engine — see [Backends](/k7d/concepts/backends).
+
+| | What |
+|---|---|
+| **Gained** | The VMM is out of the daemon's address space. Each VM has its own uid, chroot, pid namespace, cgroup, and Firecracker's default seccomp. A guest → VMM escape lands in that jail, not in `k7d`. |
+| **Unchanged** | The daemon is still host root and still one process (control socket, TAP/bridge, vsock proxy, tree bookkeeping). The shim still rewrites the OCI spec — the guest-controlled-path rules above are the floor for both backends. Network is still the daemon's bridge. Sibling CoW forks of one tree still share the daemon. |
+| **Lost** | Time warp, dilation, autowarp. virtiofs / hostPath (Create fails with `backend firecracker has no virtiofs`). Native `MAP_PRIVATE` fork latency. |
+
+`runtimeClassName: k7` stays the native in-process VMM; `k7d.katakate.org/backend: firecracker` on a `k7` pod is the per-pod opt-in, and `k7-fc` is the admission-gateable default. An explicit `backend: native` on `k7-fc` is a loud Create error.
+
+## Docker as a guest service
+
+`k7d.katakate.org/docker=true` runs a pinned `dockerd` as a child of the guest PID 1 agent (K7 exposes it as [`k7 create --docker`](/k7/guides/docker)). Its `docker.sock` is guest root: the sandbox `securityContext` no longer bounds what runs in the guest, and the only remaining boundaries are the VMM and the host-side rules above.
+
+- The payload slot (`/run/k7d/docker-tools`) is a read-only virtio-blk image, host-enforced (`O_RDONLY`, writes rejected). A guest that could rewrite `dockerd` would trojan every later sandbox.
+- The graph disk is a per-VM scratch image (`k7d.katakate.org/docker-disk`, default 20Gi), reflinked on fork and deleted with the VM — never a host directory shared across pods.
+- The CRI container is not privileged. Inner containers get dockerd's default seccomp and capabilities. Because the guest root is an initramfs, dockerd runs with `DOCKER_RAMDISK=1` so runc uses `--no-pivot` instead of `pivot_root(2)`.
+- Multi-tenant Docker should use `k7-fc`: the guest side is identical, so it is a RuntimeClass switch, not a rewrite.
+
 ## What survives a fork
 
 Everything inside the forked set: in-cluster TLS sessions, established TCP between member VMs, disk state, process state. Guest clocks are re-based so time does not jump backwards.
@@ -68,7 +112,7 @@ What doesn't: TCP to the outside world (the far end never forked). Forks keep th
 ## Current limitations
 
 - **Single host, x86_64 Linux + KVM only.** Cross-node fork is on the roadmap. Does not build on macOS/Windows.
-- **The daemon runs as root** (KVM, TAP, bridge, nftables, and cgroup setup require it). The control socket is a local Unix socket — protect host access to it.
+- **The daemon runs as root** (KVM, TAP, bridge, nftables, and cgroup setup require it). The control socket is a local Unix socket (`0660`, optional `K7D_ALLOWED_UIDS`) — protect host access to it.
 - **Young project.** One primary test machine, no external security audit yet. Small surface by design, but treat it accordingly.
 
 ## Reporting a vulnerability

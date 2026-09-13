@@ -95,12 +95,18 @@ All of these are proven by an integration test that brings the workload up on th
 | Kueue v0.19.2 on mock GPUs (quota admits one, holds the second) | digest-pinned | under 1 s |
 | KubeRay v1.7.0 (CPU head + GPU worker) | digest-pinned | 580 ms |
 | Soft-RoCE (`rdma_rxe` on guest `eth0`, `rdma link` + `ibv_devinfo` on ≥2 nodes) | in-guest | 540 ms |
+| **Redis 7** (AOF on) with an `INCR` loop mid-write on another node | manifests | **575 ms** client / 568 ms daemon; the child continues from the in-flight write |
+| Held apiserver `watch` + ClusterIP TCP stream through the fork | in-guest | streams survive on source and child, then diverge |
 
 <Warning>
 The ML rows are **mocks** — a fake device plugin and a fake metrics endpoint. They prove the operators and the schedulers fork; they are not CUDA, not NCCL, not GPUDirect, not a PyTorch runtime.
 </Warning>
 
 Image pulls are the long pole, not the fork: Cilium to 3/3 Ready is ~190 s after Helm, Longhorn ~350 s. The fork of the finished cluster stays under the 1 s ceiling in every row. Full tables: [Benchmarks](/k7d/deep-dives/benchmarks).
+
+## Surviving a daemon crash
+
+The on-disk tree outlives the daemon that forked it. If `k7d` is killed with `SIGKILL`, live KVM state dies with the process, but `{K7D_TREE_ROOT}/{tree_id}/tree.json` and every keyframe stay on disk: after `systemctl start k7d`, `tree_open` re-opens the tree with every node `Suspended`, `tree_resume root` brings the cluster back Ready from its last point, and `tree_fork_batch` forks it again — no source re-boot, no image pull. This is operational rehydrate, not live-KVM resurrection; a member's in-memory state since its last keyframe is lost.
 
 ## Persistent data disks
 

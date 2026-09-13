@@ -10,7 +10,7 @@ The `kata-qemu-longhorn` backend supports **disk-level snapshots** of running sa
 - **Fork** — clone a sandbox's disk into a brand-new sandbox with its own pod, IP, and lifecycle.
 
 <Note>
-These commands require the `kata-qemu-longhorn` backend. The `kata-firecracker-devmapper` backend uses ephemeral devmapper LVs and doesn't support persistent snapshots.
+Disk-level `k7 snapshot` requires the `kata-qemu-longhorn` backend. The `kata-firecracker-devmapper` backend uses ephemeral devmapper LVs and doesn't support persistent snapshots or fork. On `k7d` and `k7d-fc`, `k7 pause` / `k7 resume` / `k7 fork` are VM-level (memory + disk, no VolumeSnapshot) and `k7 snapshot` is rejected loudly.
 </Note>
 
 <Note>
@@ -23,8 +23,9 @@ When you create a `kata-qemu-longhorn` sandbox, k7 provisions:
 
 - A **Longhorn PVC** named `<sandbox>-root-lh`, sized via `--root-disk-size` (default `10Gi`).
 - A **Deployment** with one replica, mounting the PVC at `/mnt/state` (with persistence wrapper bind-mounts).
-- An ingress-deny `NetworkPolicy` and an egress policy (CIDR or FQDN).
+- An ingress `NetworkPolicy` (deny-all unless `ingress_ports` is set) and an egress policy (CIDR or FQDN).
 - An optional `Secret` from `env_file`.
+- With `--docker`, a second Longhorn PVC `<sandbox>-docker-lh` holding Docker's `overlay2` graph (default `20Gi`, `--docker-disk`). It is snapshotted, cloned and re-attached alongside the root PVC on pause/fork/restore.
 
 State written to `/mnt/state` (and to the rootfs via the bind-mount overlay) survives pod restarts because it lives on the PVC.
 
@@ -72,7 +73,9 @@ Fork takes a snapshot of the source sandbox's PVC, **clones it into a new PVC**,
 
 - Memory state (the new sandbox boots fresh)
 - CPU registers / process state
-- Network identity (the fork gets a new pod IP and is subject to its own NetworkPolicy)
+- Network identity (the fork gets a new pod IP)
+
+**What a fork inherits on every backend:** the source's egress whitelist *and* its `ingress_ports` / `ingress_from` policy, so a child is never more reachable than its parent (an earlier release left forks fully ingress-closed). It does **not** inherit an `expose_ports` NodePort Service — expose the child explicitly if you need it. A `--docker` source forks with its graph disk (`kql`: cloned PVC; `k7d` / `k7d-fc`: reflinked scratch disk, dockerd keeps running with `overlay2`); `kfd` rejects fork.
 
 ## Observed performance
 
@@ -86,7 +89,7 @@ Single-node medians (Hetzner AX41, Longhorn `replicas=1`, 2026-08-10) — see [P
 | Resume → exec | 4.1 s | **0.3 s** |
 | **Fork → usable** | **46.7 s** (disk clone + cold boot) | **2.4 s** (warm memory CoW) |
 
-On a two-node r=2 cluster (2026-08-18 Show HN cut) kql fork is ~83 s; k7d fork stays ~4 s and is the only backend whose fork inherits live memory (`/tmp` markers, running processes).
+On a two-node r=2 cluster (2026-08-18 Show HN cut) kql fork is ~83 s; k7d fork stays ~4 s and is the only backend whose fork inherits live memory (`/tmp` markers, running processes). `k7d-fc` (k7d driving stock Firecracker) sits close to `k7d`: create → Ready 2.1 s and fork → exec ~2.45 s on the same node (2026-09-10). Forking a warm `--docker` engine takes ~6.8 s (`k7d`) / ~9.1 s (`k7d-fc`) to Ready with `overlay2` still active in the child — see [Docker in a sandbox](/k7/guides/docker).
 
 ## Example: a parallel exploration with fork
 
@@ -95,7 +98,7 @@ A common AI workflow is to set up a heavy environment once, then explore many br
 ```python
 from k7_sdk import Client
 
-k7 = Client(endpoint="http://node:31007", api_key="...")
+k7 = Client(endpoint="https://node:31007", api_key="...", verify_ssl="./k7-ca.crt")
 
 # Step 1: prepare a base sandbox with a big environment
 base = k7.create({
@@ -132,7 +135,7 @@ Each `exp-N` boots from a clone of `base`'s disk — the heavy `pip install` doe
 
 ## Cleanup
 
-`k7 delete demo` removes the Deployment, the PVC, and any pause/fork snapshots associated with the sandbox. To inspect what's still around:
+`k7 delete demo` removes the Deployment, the PVCs (root and, with `--docker`, the graph disk), and any pause/fork snapshots associated with the sandbox. `k7 snapshot gc` reaps unreferenced snapshots and now also deletes orphan `VolumeSnapshotContent` objects and clears the PVC finalizer that used to leave Longhorn volumes stuck. To inspect what's still around:
 
 ```bash
 sudo k3s kubectl get pvc,volumesnapshot -A | grep demo

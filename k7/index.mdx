@@ -7,14 +7,20 @@ description: "Secure sandboxed compute for AI agents and workloads"
 <img src="/k7/images/k7-cover-upgrade.png" alt="Katakate logo" />
 </Frame>
 
-Katakate (k7) is self-hosted infra for secure VM sandboxes — orchestrated with Kubernetes, driven by a CLI, REST API, and Python SDK. Pick a backend per sandbox: Firecracker (`kfd`), QEMU + Longhorn (`kql`), or [k7d](/k7d/index) for warm CoW forks in milliseconds.
+Katakate (k7) is self-hosted infra for secure VM sandboxes — orchestrated with Kubernetes, driven by a CLI, REST API, and Python SDK. Pick a backend per sandbox: Firecracker via Kata (`kfd`), QEMU + Longhorn (`kql`), [k7d](/k7d/index) for warm CoW forks in milliseconds, or `k7d-fc` — the same k7d daemon driving jailed Firecracker. Run `docker build` inside any of them with `--docker`; sandboxes are locked away from the platform by default and reachable only through the ports you open.
 
 <CardGroup cols={2}>
 <Card title="Quickstart" icon="rocket" href="/k7/getting-started/installation">
-Get running in minutes: install, enable the API, create your first sandbox.
+Get running in minutes: install, trust the API's CA, create your first sandbox.
 </Card>
 <Card title="CLI" icon="terminal" href="/k7/guides/cli">
 All `k7` commands with examples.
+</Card>
+<Card title="Backends" icon="server" href="/k7/concepts/backends">
+kfd, kql, k7d, k7d-fc — pick per sandbox; what forks, what persists, what is jailed.
+</Card>
+<Card title="Docker in a sandbox" icon="docker" href="/k7/guides/docker">
+`k7 create --docker`: pinned dockerd, overlay2 on a block disk, forkable on k7d.
 </Card>
 <Card title="Python SDK" icon="python" href="/k7/guides/python-sdk">
 Sync and async clients with complete examples.

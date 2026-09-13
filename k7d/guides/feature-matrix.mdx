@@ -44,20 +44,24 @@ Need CoreDNS + Ingress on one CI-guest cluster? Flip the profile flags — the s
 
 ## Host RuntimeClass (pods *as* k7d VMs)
 
-This is the outer layer: kubectl on the host schedules pods into k7d microVMs via [`runtimeClassName: k7`](/k7d/guides/runtime-class). Relevant if you also want single-VM sandboxes, not only whole-cluster forks.
+This is the outer layer: kubectl on the host schedules pods into k7d microVMs via [`runtimeClassName: k7`](/k7d/guides/runtime-class) (native engine) or `k7-fc` (stock Firecracker under the jailer — see [Backends](/k7d/concepts/backends)). Relevant if you also want single-VM sandboxes, not only whole-cluster forks. Rows apply to both RuntimeClasses unless the notes say otherwise.
 
 | Feature | Status | Notes |
 |---|---|---|
 | `runtimeClassName: k7` (CRI / containerd shim) | ✅ Today | |
+| `runtimeClassName: k7-fc` (same shim, Firecracker + jailer) | ✅ Today | `ConfigPath` runtime option; PodOverhead 32Mi / 50m; per-pod opt-in on `k7` via `k7d.katakate.org/backend: firecracker` |
 | `kubectl logs` / `exec` / `exec -it` (PTY) | ✅ Today | Incl. resize, Ctrl-C, detach |
 | Pod IP, Services, DNS, egress | ✅ Today | Host CNI dataplane |
 | ConfigMap / Secret / projected / downwardAPI / emptyDir | ✅ Today | |
-| hostPath, local-path PVC, k7d RWO disk volumes | ✅ Today | |
+| hostPath, local-path PVC, k7d RWO disk volumes | ✅ Today | `k7` only — `k7-fc` has no virtiofs; hostPath / virtiofs fallback fails Create with a named error. `K7D_DENY_VIRTIOFS_FALLBACK=1` makes `k7` behave the same |
 | Writable scratch on a host disk; per-container scratch; named persistent data disks | ✅ Today | `k7d.katakate.org/scratch-size`, `container-scratch-size`, `data-disks` annotations |
 | Memory / CPU limits; multi-container / sidecars | ✅ Today | |
+| Pod `securityContext` inside the VM (seccomp, masked/readonly paths, device cgroups, caps, `noNewPrivileges`) | ✅ Today | Passed through to guest runc unchanged; only `apparmorProfile`, host `cgroupsPath` and host namespace paths are stripped |
+| In-guest Docker (`k7d.katakate.org/docker=true`) | ✅ Today | Agent-supervised pinned dockerd, overlay2 graph on a per-VM disk, forkable; both engines |
 | Warm VM + whole-cluster fork / snapshot tree | ✅ Today | The point of the project |
 | Init containers; natural exit / `restartPolicy` | ✅ Today | Multi-container pods |
 | Multi-vCPU guests (`cpu: "2"+`) | ✅ Today | vCPU count derived from the pod's CPU limit; fork/snapshot parity |
-| Pause / resume a pod's VM | ✅ Today | `pause_vm` / `resume_vm`; CID and memory retained |
+| Pause / resume a pod's VM | ✅ Today | `pause_vm` / `resume_vm`; CID and memory retained. On `k7-fc`, CRI exec after a pause/resume cycle has been observed to hang |
+| Time warp / dilation / autowarp | ✅ Today | `k7` only — unsupported on `k7-fc` (named error) |
 | `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | Host RuntimeClass only — in-cluster Cilium NetworkPolicy and Longhorn RWX are the rows above |
 | Cross-node fork | 🔮 Later | Host-local trees today |

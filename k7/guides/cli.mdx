@@ -9,19 +9,22 @@ Use `k7 -h` for built-in help. Below are the primary commands.
 
 By default, every sandbox-management command (`create`, `list`, `delete`,
 `pause`, `resume`, `fork`, `restore`, `exec`, `logs`, `snapshot *`) talks
-to the **K7 API** over HTTPS. The CLI resolves the URL and key in this
+to the **K7 API** over HTTPS. The CLI resolves the URL, key, and CA in this
 order:
 
-1. `--api-url` / `--api-key` flags (per command).
-2. `K7_API_URL` / `K7_API_KEY` environment variables.
+1. `--api-url` / `--api-key` / `--api-ca` flags (global, before the command).
+2. `K7_API_URL` / `K7_API_KEY` / `K7_API_CA` environment variables.
 3. `~/.config/k7/config.toml` — written by `k7 config set api.url ...` /
-   `k7 config set api.key ...`.
-4. On a cluster node only: `/etc/k7/api_endpoint` and the first entry of
-   `/etc/k7/api_keys.json`.
+   `k7 config set api.key ...` / `k7 config set api.ca ...`.
+4. On a cluster node only: `/etc/k7/api_endpoint`, `/etc/k7/tls/ca.crt`, and
+   the first entry of `/etc/k7/api_keys.json`.
 
 ```bash
-# One-time setup on your laptop.
-k7 config set api.url   https://10.0.0.1:31000
+# One-time setup on your laptop. The default install mints a cluster CA;
+# copy it off the node so the CLI can verify the API's certificate.
+scp root@node:/etc/k7/tls/ca.crt ./k7-ca.crt
+k7 config set api.url   https://<node-ip>:31007
+k7 config set api.ca    ./k7-ca.crt
 k7 config set api.key   $(ssh root@node 'jq -r ".[0].token" /etc/k7/api_keys.json')
 
 # Then everything Just Works without SSH'ing to the node.
@@ -31,6 +34,11 @@ k7 fork demo demo-1
 k7 exec demo -- echo hello
 k7 logs demo --tail 50
 ```
+
+An `https://` URL is always verified: there is no `--insecure`. If the
+cluster was installed with `--api-hostname` (Let's Encrypt) the system
+trust store is enough and `api.ca` is not needed; with `--api-insecure-http`
+use an `http://` URL.
 
 ### `--core` (debugging / on-node CI only)
 
@@ -46,15 +54,15 @@ k7 --core logs demo --follow      # required if you want live --follow today
 ## config
 
 ```bash
-k7 config set KEY VALUE        # KEY ∈ {api.url, api.key}
+k7 config set KEY VALUE        # KEY ∈ {api.url, api.key, api.ca}
 k7 config get KEY
 k7 config show                 # api.key is redacted
 ```
 
 Writes `~/.config/k7/config.toml` with mode `0600`. Same posture as
-`~/.kube/config` and `~/.docker/config.json`. For production use, put
-the API behind ingress + TLS + IP allowlist; the plaintext key file is
-suitable for demos and trusted networks today.
+`~/.kube/config` and `~/.docker/config.json`. `api.ca` is the path of the
+CA bundle to trust for the `https://` API URL (the cluster CA from
+`/etc/k7/tls/ca.crt` on the default install).
 
 ## install
 
@@ -62,23 +70,31 @@ Install K7 components on host node(s).
 
 ```bash
 k7 install [-v]                                # localhost, default kata backends
-k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
-k7 install --backend k7d --k7d-artifact /root/k7d-v0.2.1-x86_64-linux.tar.gz
+k7 install --backend kfd,kql,k7d,k7d-fc        # all four backends (k7d release pinned by the playbook)
+k7 install --backend k7d --k7d-artifact /root/k7d-v0.6.0-x86_64-linux.tar.gz
 k7 install -i inventory.ini --ha               # multi-node HA (3+ servers)
 k7 install --role agent --join https://master:6443 --join-token TOKEN
+k7 install --hubble --api-allow-cidr 203.0.113.4/32   # observability + API source allowlist
+k7 install --api-hostname k7.example.com       # Let's Encrypt cert instead of the cluster CA
 ```
 
 - **-v**: verbose output
-- **--backend, -b**: comma-separated backends: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), `k7d`. Default installs the two Kata backends; add `k7d` explicitly for the warm-fork microVM runtime.
+- **--backend, -b**: comma-separated backends: `kata-firecracker-devmapper` (`kfd`), `kata-qemu-longhorn` (`kql`), `k7d`, `k7d-fc`. Default installs the two Kata backends; add `k7d` for the warm-fork microVM runtime and `k7d-fc` for the same daemon driving jailed Firecracker (installs pinned Firecracker v1.16.1 + jailer, RuntimeClass `k7-fc`).
 - **--disk**: block device for the kfd LVM thin-pool (auto-detected when omitted). On dual-NVMe boxes leave this unset — NVMe names swap across reboots.
-- **--k7d-version**: k7d release to download (k7d backend only). k7 **0.2.2+** playbook default is `0.2.1`. PPA `k7` 0.2.1 still defaults to k7d 0.1.0 — pass `--k7d-version 0.2.1`.
-- **--k7d-artifact**: local k7d release tarball to install instead of downloading (k7d backend only).
+- **--k7d-version**: k7d release to download (k7d backends only). Playbook default is **`0.6.0`** (Firecracker engine + guest docker payload). Override with `--k7d-artifact` for a local tarball.
+- **--k7d-artifact**: local k7d release tarball to install instead of downloading (k7d backends only).
 - **-i, --inventory**: Ansible inventory for multi-node installs (per-host `k7_backends` is authoritative — don't combine with `--backend`).
 - **--ha**: multi-master HA with embedded etcd (inventory with 3+ servers).
 - **--role / --join / --join-token**: add a single node to an existing cluster.
+- **--cni**: `cilium` (default; FQDN egress, platform isolation, `--api-allow-cidr`) or `flannel` (CIDR-only egress).
+- **--hubble**: opt-in Cilium Hubble flow observability (relay + pinned `hubble` CLI, no UI). Requires Cilium. Not a security control.
+- **--api-allow-cidr CIDR**: repeatable. Restrict the `k7-api` NodePort to these source CIDRs via a `CiliumNetworkPolicy` and `externalTrafficPolicy: Local`. Off by default; Cilium only; `0.0.0.0/0` warns.
+- **--api-hostname NAME**: DNS name pointing at the first master; Caddy obtains a Let's Encrypt certificate (HTTP-01 on `:80`). A bare IP is refused.
+- **--api-tls-cert / --api-tls-key**: operator-supplied server certificate + key (PEM). Both required together; incompatible with `--api-hostname`.
+- **--api-insecure-http**: serve `k7-api` as a plain HTTP NodePort (no Caddy sidecar). Keys travel in cleartext. Cannot be combined with the hostname / cert flags.
 - **--no-api**: CLI-only install without the k7-api Deployment.
 
-See [Multi-node clusters](/k7/guides/multi-node) for the inventory format and topology.
+See [Multi-node clusters](/k7/guides/multi-node) for the inventory format and topology, and [Security model](/k7/concepts/security-model#api-transport-tls) for how the TLS options fit together.
 
 ## version
 
@@ -102,14 +118,23 @@ k7 create --name my-sb --image alpine:latest \
 
 # Egress: no flag = block-all; --egress CIDR|FQDN (repeatable); --egress-open = no policy
 k7 create --name open --image alpine:latest --egress-open
+
+# Docker inside the sandbox (pinned dockerd, overlay2 on a 20Gi block disk)
+k7 create --docker --backend k7d --docker-disk 40Gi builder ubuntu:24.04
+
+# Ingress: deny-all by default; open a port to one peer sandbox, then publish it
+k7 create --ingress-port 8000 --ingress-from sandbox:frontend api python:3.12-slim
+k7 create --ingress-port 8000 --ingress-from cidr:203.0.113.0/24 --expose-port 8000 web python:3.12-slim
+# 🌐 Port 8000 exposed at http://<node-ip>:31234
 ```
 
 ## pause
 
 On **kql**, scale a sandbox to 0 replicas, optionally taking a crash-consistent
-`VolumeSnapshot` of its root PVC (`longhorn` `VolumeSnapshotClass`). On **k7d**,
-pause freezes the live VM in place (vCPUs stop, memory stays) — no snapshot.
-`--snapshot` is kata-qemu-longhorn-only.
+`VolumeSnapshot` of its root PVC (`longhorn` `VolumeSnapshotClass`) — and of the
+`<name>-docker-lh` graph PVC when the sandbox was created with `--docker`. On
+**k7d** / **k7d-fc**, pause freezes the live VM in place (vCPUs stop, memory
+stays) — no snapshot. `--snapshot` is kata-qemu-longhorn-only.
 
 ```bash
 k7 pause NAME                       # scale to 0, no snapshot
@@ -132,7 +157,9 @@ k7 resume NAME [-n NAMESPACE]
 ```
 
 On **kql**, scales the Deployment back to 1; state on the root PVC survives.
-On **k7d**, restarts the vCPU loop — in-memory state is intact.
+On **k7d**, restarts the vCPU loop — in-memory state is intact. On **k7d-fc**
+the VMM resumes the same way, but CRI exec after resume has been observed to
+hang on the current cut — see [Backends](/k7/concepts/backends#k7d-fc).
 
 ## restore
 
@@ -145,12 +172,12 @@ k7 restore SNAPSHOT_NAME NEW_SANDBOX_NAME [-n NAMESPACE]
   [--image IMAGE]                     # override (required if snapshot lacks k7.io/source-image)
   [--root-disk-size 20Gi]
   [--cpu 2] [--memory 4Gi] [--storage 10Gi]
-  [--sidecar docker]
+  [--sidecar docker]                  # deprecated alias of --docker
   [--cmd ...] [--entrypoint ...]      # repeatable
   [--keep-snapshot/--no-keep-snapshot]
 ```
 
-Image / backend / sidecar / limits / root-disk-size default to the source
+Image / backend / docker / limits / root-disk-size default to the source
 sandbox's values via the `k7.io/source-*` annotations stamped on the snapshot
 at creation time (pause / named only — fork-temp snapshots are auto-deleted).
 Any flag above overrides the corresponding annotation. `--no-keep-snapshot`
@@ -171,9 +198,11 @@ k7 restore v1 demo-v1 --image python:3.12-slim
 
 Clone an existing sandbox. Behavior depends on the backend:
 
-- **`k7d`** — warm CoW fork of **disk and memory** (~5 ms at the VMM, ~2–4 s end-to-end to a Ready pod). The child inherits files, tmpfs, and running processes. Lands on the source's node. Sidecar-equipped sandboxes cannot be forked on k7d.
-- **`kql` / `kata-qemu-longhorn`** — disk-only clone via a crash-consistent VolumeSnapshot of `<sandbox>-root-lh`, then a cold boot (~45 s single-node; longer with Longhorn replicas ≥ 2).
+- **`k7d`** / **`k7d-fc`** — warm CoW fork of **disk and memory** (~5 ms at the VMM, ~2–4 s end-to-end to a Ready pod). The child inherits files, tmpfs, and running processes — including a live `--docker` engine and its inner containers. Lands on the source's node. Sandboxes with a real CRI sidecar cannot be forked.
+- **`kql` / `kata-qemu-longhorn`** — disk-only clone via a crash-consistent VolumeSnapshot of `<sandbox>-root-lh` (and `<sandbox>-docker-lh` with `--docker`), then a cold boot (~45 s single-node; longer with Longhorn replicas ≥ 2).
 - **`kfd`** — rejected.
+
+The fork inherits the source's egress **and** ingress policy (but not its `--expose-port` Service) and is rolled back if the policies cannot be created.
 
 ```bash
 k7 fork source-sandbox new-sandbox [--snapshot custom-name]
@@ -198,7 +227,7 @@ k7 snapshot delete NAME [-n NS] [--yes]                  # delete one snapshot (
 k7 snapshot gc [-n NS] [-A] [--keep-fork-for 10m] [--dry-run]
 ```
 
-`gc` only ever touches `kind=fork` snapshots older than `--keep-fork-for`. Pause and named snapshots are never collected, even with `--keep-fork-for=0s`. A CronJob (`k7-snapshot-gc` in `kube-system`) runs the same logic every 10 minutes as a backstop, in case the inline cleanup after `k7 fork` ever misses a snapshot.
+`gc` only ever touches `kind=fork` snapshots older than `--keep-fork-for`. Pause and named snapshots are never collected, even with `--keep-fork-for=0s`. A CronJob (`k7-snapshot-gc` in `kube-system`) runs the same logic every 10 minutes as a backstop, in case the inline cleanup after `k7 fork` ever misses a snapshot. GC also reaps orphan `VolumeSnapshotContent` objects whose `VolumeSnapshot` is gone or deleting and clears the PVC source-protection finalizer, so a deleted namespace no longer sticks in `Terminating` on `volumesnapshotcontent-bound-protection`.
 
 ### YAML configuration reference
 
@@ -206,11 +235,17 @@ All fields map to the server-side `SandboxConfig`:
 
 - **name** (string, required): unique sandbox name.
 - **image** (string, required): container image, e.g. `alpine:latest`. Registry host must be public and on the allowlist (`registry-1.docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`; extend with `K7_REGISTRY_ALLOWLIST`).
-- **backend** (string, optional): `kata-firecracker-devmapper` / `kfd`, `kata-qemu-longhorn` / `kql`, or `k7d`.
-- **sidecar** (string, optional): sidecar type, e.g. `docker`.
+- **backend** (string, optional): `kata-firecracker-devmapper` / `kfd`, `kata-qemu-longhorn` / `kql`, `k7d`, or `k7d-fc`.
+- **docker** (boolean, default `false`): run a pinned `dockerd` inside the sandbox with `overlay2` on a block graph disk — see [Docker in a sandbox](/k7/guides/docker).
+- **docker_disk** (string, default `20Gi`): graph disk size for `docker: true`.
+- **sidecar** (string, optional): deprecated; `docker` is an alias of `docker: true`.
 - **namespace** (string, default `default`): Kubernetes namespace.
 - **env_file** (string, optional): (absolute) path to an env file on the host node.
 - **egress_whitelist** (array of CIDR or FQDN strings, optional): omit / `null` = open egress; `[]` = block-all; listed entries = allowlist. FQDNs need Cilium (the default CNI). CLI `k7 create` without `--egress` / `--egress-open` is block-all.
+- **ingress_ports** (int[], optional): TCP ports to open for inbound traffic. Omit / `[]` = deny all ingress (default).
+- **ingress_from** (string[], optional): who may reach `ingress_ports` — `sandbox:<name>`, `namespace:<ns>`, `cidr:<cidr>`. Omitted with ports set = sandboxes in the same namespace. Requires `ingress_ports`.
+- **expose_ports** (int[], optional): publish these TCP ports outside the cluster via a `NodePort` Service; each must also be in `ingress_ports`.
+- **volumes** (object[], optional): hostPath / PVC entries. Refused on `k7d-fc` (Firecracker has no virtiofs).
 - **limits** (object, optional): resource limits:
   - **cpu** (string): cores or millicores, e.g. `"1"` or `"500m"`.
   - **memory** (string): e.g. `"1Gi"`, `"512Mi"`.
@@ -227,10 +262,11 @@ Example `k7.yaml`:
 ```yaml
 name: project-build
 image: alpine:latest
-backend: k7d            # or kfd / kql
+backend: k7d            # or kfd / kql / k7d-fc
 namespace: default
 egress_whitelist:
   - "10.0.0.5/32"      # Private egress proxy/gateway
+ingress_ports: [8000]  # reachable from other sandboxes in this namespace only
 limits:
   cpu: "1"
   memory: "1Gi"
@@ -258,7 +294,7 @@ If using package managers that require root (e.g., `apk add`, `apt-get install`)
 ```bash
 k7 list [-n NAMESPACE]
 ```
-Lists sandboxes with status, readiness, restarts, age, and image.
+Lists sandboxes with status, readiness, restarts, age, image, backend, node, and the NodePorts allocated by `--expose-port` (empty when the sandbox is not exposed).
 
 ## delete
 
@@ -307,7 +343,7 @@ Per-node storage-pool utilization, collected from the `k7-agent` DaemonSet on ev
 - **`kata_thinpool`** — the kfd LVM thin-pool (`lvs` size, data%, metadata%).
 - **`k7d_disks`** — the k7d XFS disk pool at `/var/lib/k7d/disks` (`df` size / used / avail).
 
-A node whose agent is unreachable shows a loud `error` entry — nodes are never silently omitted. Also available as `GET /api/v1/nodes/storage` ([API reference](/k7/api/endpoints/nodes)) and `Client.nodes_storage()` in the SDK.
+A node whose agent is unreachable shows a loud `error` entry — nodes are never silently omitted. Also available as `GET /api/v1/nodes/storage` ([API reference](/k7/api/endpoints/nodes)) and `Client.nodes_storage()` in the SDK. This is cluster-wide topology, so a **namespace-scoped** API key gets `403`.
 
 ## api
 
@@ -318,10 +354,12 @@ provides read-only diagnostics and a feature toggle:
 
 ```bash
 k7 api status        # readiness, endpoint, key-management hints
-k7 api endpoint      # just the URL (machine-readable, single line)
+k7 api endpoint      # just the URL (machine-readable, single line) — https://<first-master>:31007
 k7 api enable        # scale the existing Deployment to 1 (turn back on)
 k7 api disable       # scale to 0 (temporary off)
 ```
+
+The endpoint is HTTPS by default, terminated by a Caddy sidecar in the `k7-api` pod. The cluster CA lives at `/etc/k7/tls/ca.crt` on the node — copy it to clients (`k7 config set api.ca`). `k7 install --api-hostname` (Let's Encrypt), `--api-tls-cert/--api-tls-key`, and `--api-insecure-http` change what is served; see [install](#install).
 
 To install without the API (CLI-only deployment, e.g. for local-only
 test rigs), pass `--no-api` to `k7 install`. Re-run `k7 install` later
@@ -354,8 +392,10 @@ Keys are stored at `/etc/k7/api_keys.json`. Use with `X-API-Key` or `Authorizati
 - **-f, --file**: YAML config file (defaults to `k7.yaml` when using `k7 create`).
 - **--name**: Sandbox name (when not using YAML).
 - **--image**: Container image (when not using YAML).
-- **-b, --backend**: `kfd` / `kql` / `k7d` (or the long names).
-- **--sidecar**: Sidecar type (e.g. `docker`).
+- **-b, --backend**: `kfd` / `kql` / `k7d` / `k7d-fc` (alias `k7-fc`, or the long names).
+- **--docker**: Run a pinned `dockerd` (overlay2 on a block graph disk). k7d / k7d-fc: guest agent service, forkable. Kata (kfd / kql): privileged `docker-vehicle` in the VM; kql persists the graph, kfd is ephemeral.
+- **--docker-disk**: Docker graph disk size for `--docker` (e.g. `20Gi`, `40Gi`). Default `20Gi` on all backends.
+- **--sidecar**: Deprecated. `--sidecar docker` is an alias of `--docker`.
 - **--cpu**: CPU limit (e.g., `1`, `500m`).
 - **--memory**: Memory limit (e.g., `1Gi`, `512Mi`).
 - **--storage**: Ephemeral storage limit (e.g., `2Gi`).
@@ -363,6 +403,9 @@ Keys are stored at `/etc/k7/api_keys.json`. Use with `X-API-Key` or `Authorizati
 - **--env-file**: Path to env file on the host node injected as a Secret.
 - **--egress ENTRY**: Repeatable; whitelist CIDR or FQDN. Default (no flag): **block all**.
 - **--egress-open**: Allow all egress. Mutually exclusive with `--egress`.
+- **--ingress-port PORT**: Repeatable; TCP port to open for inbound traffic. Default (no flag): **deny all ingress**.
+- **--ingress-from SOURCE**: Repeatable; `sandbox:<name>` | `namespace:<ns>` | `cidr:<cidr>`. Default when `--ingress-port` is given: sandboxes in the same namespace. Reaching the sandbox from anywhere needs `cidr:0.0.0.0/0`, spelled out. Requires `--ingress-port`.
+- **--expose-port PORT**: Repeatable; publish a TCP port outside the cluster through a `NodePort` Service (`externalTrafficPolicy: Local`). Requires a matching `--ingress-port`. On a public node the node IP is public too.
 - **--before-script**: Shell script to run once after container start; runs with open egress before lockdown.
 - **--entrypoint**: Repeatable; override image ENTRYPOINT (ordered).
 - **--cmd**: Repeatable; override image CMD (ordered).
@@ -372,7 +415,7 @@ Keys are stored at `/etc/k7/api_keys.json`. Use with `X-API-Key` or `Authorizati
 - **--cap-drop CAP**: Repeatable; override default drop policy.
 
 <Info>
-Package installs like `apk add` require root inside the container. Either leave `container_non_root` disabled for setup or prebuild an image. See Security & networking: `/api/security`.
+Package installs like `apk add` require root inside the container. Either leave `container_non_root` disabled for setup or prebuild an image. See [Security & networking](/k7/api/security).
 </Info>
 
 <Info>

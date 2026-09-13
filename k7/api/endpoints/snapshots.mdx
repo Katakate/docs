@@ -129,8 +129,9 @@ Body:
 
 - `new_sandbox_name` (required) — name for the restored sandbox.
 - `overrides` (optional) — any combination of `image`, `backend`,
-  `root_disk_size`, `sidecar`, `limits`, `entrypoint`, `cmd`,
-  `before_script`. Each override wins over the snapshot's
+  `root_disk_size`, `sidecar` (`"docker"` is the deprecated alias of
+  `docker: true`; restore does not accept `docker` / `docker_disk` yet),
+  `limits`, `entrypoint`, `cmd`, `before_script`. Each override wins over the snapshot's
   `k7.io/source-*` annotation; fields not supplied fall back to the
   annotation. **`image` is the only field with no safe default** —
   restore fails with a clear error if the snapshot lacks

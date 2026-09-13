@@ -3,19 +3,23 @@ title: "Quickstart"
 description: "Install k7, prepare your node, start the API, and run your first sandbox"
 ---
 
-Katakate (k7) lets you run secure VM sandboxes on Kubernetes — Firecracker, QEMU + Longhorn, or [k7d](/k7d/index). This Quickstart gets you from zero to a working sandbox via CLI and Python SDK.
+Katakate (k7) lets you run secure VM sandboxes on Kubernetes — Firecracker, QEMU + Longhorn, or [k7d](/k7d/index) (natively or under the Firecracker jailer). This Quickstart gets you from zero to a working sandbox via CLI and Python SDK.
 
 <Note>
 If you already installed k7 previously, consider running `make uninstall` before reinstalling to avoid stale cached files in a previous `.deb`.
+</Note>
+
+<Note>
+These pages track **k7 0.3.0** (HTTPS-by-default, `--docker`, `k7d-fc`, Cilium isolation). The playbook pins [k7d 0.6.0](https://github.com/Katakate/k7d/releases/tag/v0.6.0). Older PPA packages (0.2.2 and earlier) still serve the API over plain HTTP and pin an older k7d. Read the [CHANGELOG](https://github.com/Katakate/k7/blob/main/CHANGELOG.md).
 </Note>
 
 ## Requirements
 
 - Ubuntu host with hardware virtualization (KVM)
   - Check: `ls /dev/kvm` should exist
-  - **`kfd` and `kql`**: amd64 or arm64. **`k7d` is amd64 / x86_64 only.**
+  - **`kfd` and `kql`**: amd64 or arm64. **`k7d` and `k7d-fc` are amd64 / x86_64 only.**
   - Cloud guidance: AWS `.metal`, GCP (enable nested virtualization), Azure D/Ev series; typical VPS often lack KVM. Hetzner: Robot dedicated only (not Cloud VPS).
-- For the `kfd` (Firecracker) backend: one raw, unformatted disk for the LVM thin-pool. `kql` and `k7d` do not need a spare disk.
+- For the `kfd` (Firecracker) backend: one raw, unformatted disk for the LVM thin-pool. `kql`, `k7d`, and `k7d-fc` do not need a spare disk.
 - Docker (the install playbook builds the `k7-api:local` image on the node). Compose is **not** required to run the API — it is a K3s Deployment.
   - Install Docker: `curl -fsSL https://get.docker.com | sh`
 - Ansible for the installer (Ubuntu):
@@ -44,13 +48,13 @@ sudo apt install k7
 
 ## Install K7 on your node(s)
 
-`k7 install` with no flags provisions **both Kata backends** (`kfd` + `kql`) on localhost. Add `k7d` explicitly for the warm-fork microVM runtime. The playbook in k7 **0.2.2+** downloads [k7d 0.2.1](https://github.com/Katakate/k7d/releases/tag/v0.2.1) by default; **PPA `k7` 0.2.1 still defaults k7d to 0.1.0**, so pin the version:
+`k7 install` with no flags provisions **both Kata backends** (`kfd` + `kql`) on localhost. Add `k7d` explicitly for the warm-fork microVM runtime, and `k7d-fc` for the same runtime under the Firecracker jailer. The playbook pins [k7d 0.6.0](https://github.com/Katakate/k7d/releases/tag/v0.6.0):
 
 ```bash
-k7 install --backend kfd,kql,k7d --k7d-version 0.2.1
+k7 install --backend kfd,kql,k7d,k7d-fc
 ```
 
-That installs and wires up Kubernetes (K3s), Kata, Firecracker + Jailer + thin-pool (`kfd`), QEMU + Longhorn (`kql`), and the k7d daemon + `RuntimeClass k7`. Pass `-v` for verbose output. Two-node / HA inventories: [Multi-node clusters](/k7/guides/multi-node).
+That installs and wires up Kubernetes (K3s), Cilium, Kata, Firecracker + Jailer + thin-pool (`kfd`), QEMU + Longhorn (`kql`), the k7d daemon + `RuntimeClass k7` (`k7d`), and pinned upstream Firecracker v1.16.1 + `RuntimeClass k7-fc` (`k7d-fc`). It also deploys the `k7-api` over HTTPS with a cluster CA. Pass `-v` for verbose output. Two-node / HA inventories: [Multi-node clusters](/k7/guides/multi-node); install-time security knobs (`--api-allow-cidr`, `--api-hostname`, `--hubble`): [CLI reference](/k7/guides/cli#install).
 
 ![Example output: k7 install](/k7/images/ex-install.png)
 
@@ -74,8 +78,21 @@ k7 api status
 ### Get the endpoint
 
 ```bash
-k7 api endpoint
+k7 api endpoint          # https://<first-master-ip>:31007
 ```
+
+### Trust the cluster CA from your laptop
+
+The default install serves the API over HTTPS with a certificate signed by a cluster CA the playbook minted (Let's Encrypt cannot issue for a bare IP). Copy the CA off the node once and point the CLI at it:
+
+```bash
+scp root@<node>:/etc/k7/tls/ca.crt ./k7-ca.crt
+k7 config set api.url https://<node-ip>:31007
+k7 config set api.ca  ./k7-ca.crt
+k7 config set api.key <key>          # from the next step
+```
+
+If you installed with `--api-hostname k7.example.com`, the certificate is publicly trusted and `api.ca` is unnecessary. On the node itself the CLI finds `/etc/k7/api_endpoint` and `/etc/k7/tls/ca.crt` automatically.
 
 ### Generate an API key
 
@@ -128,8 +145,11 @@ egress_whitelist: []
 # Uses k7.yaml in the current directory by default
 k7 create
 
-# Or pick a backend (kfd | kql | k7d)
+# Or pick a backend (kfd | kql | k7d | k7d-fc)
 k7 create -f k7.yaml --backend k7d
+
+# Need docker build / docker run inside the sandbox? (see the Docker guide)
+k7 create --docker --backend k7d --egress-open builder ubuntu:24.04
 ```
 
 <Note>
@@ -187,7 +207,9 @@ Use the synchronous client:
 ```python
 from k7_sdk import Client
 
-k7 = Client(endpoint="https://<your-endpoint>", api_key="<your-key>")
+# verify_ssl takes the CA bundle path on the default (cluster-CA) install;
+# leave it at True for a Let's Encrypt (--api-hostname) cluster.
+k7 = Client(endpoint="https://<node-ip>:31007", api_key="<your-key>", verify_ssl="./k7-ca.crt")
 
 # Create sandbox
 sb = k7.create({
@@ -211,7 +233,7 @@ import asyncio
 from k7_sdk import AsyncClient
 
 async def main():
-    k7 = AsyncClient(endpoint="https://<your-endpoint>", api_key="<your-key>")
+    k7 = AsyncClient(endpoint="https://<node-ip>:31007", api_key="<your-key>", verify_ssl="./k7-ca.crt")
     print(await k7.list())
     await k7.aclose()
 
@@ -220,8 +242,9 @@ asyncio.run(main())
 
 ## Next steps
 
-- Explore the CLI guide: `/guides/cli`
-- Explore the Python SDK guide: `/guides/python-sdk`
-- Integrate with the REST API: `/api/introduction`
+- Explore the [CLI guide](/k7/guides/cli)
+- Explore the [Python SDK guide](/k7/guides/python-sdk)
+- Run [Docker inside a sandbox](/k7/guides/docker)
+- Integrate with the [REST API](/k7/api/introduction)
 
 

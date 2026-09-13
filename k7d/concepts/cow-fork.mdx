@@ -46,6 +46,10 @@ The fork inherits the source's vsock device state, including any open agent conn
 
 Guest clocks are re-based so time does not jump backwards — and because k7d owns the guest clock end to end, the same pause can also move it *forward* on purpose. That is [Time warp](/k7d/guides/time-warp).
 
+## The Firecracker variant
+
+Everything above describes the native engine, where parent and child memory are mappings in one process. A `backend: firecracker` VM lives in a separate jailed process, so there is nothing to `MAP_PRIVATE`: the daemon asks Firecracker for a **Diff** snapshot (only pages dirtied since the last point), `FICLONERANGE`s those extents onto a shared base file, reflinks the base once per child, and `LoadSnapshot`s a fresh jailed Firecracker from that reflink with `mem_backend: File`. The child's memory is still CoW — every extent reports `FIEMAP_EXTENT_SHARED` — but the fork costs ~190 ms instead of ~5 ms, mostly in staging the jail. [Backends](/k7d/concepts/backends) has the mechanics and the latency table.
+
 ## Related pages
 
 - [Snapshot tree](/k7d/concepts/snapshot-tree) — how forks are organized, budgeted, and evicted

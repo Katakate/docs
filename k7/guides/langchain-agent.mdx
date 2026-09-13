@@ -16,8 +16,9 @@ This tutorial walks you through wiring a LangChain ReAct agent with a tool that 
 Create a `.env` file with your credentials and defaults:
 
 ```env
-K7_ENDPOINT=https://your-k7-endpoint
+K7_ENDPOINT=https://your-k7-endpoint:31007
 K7_API_KEY=your-api-key
+K7_API_CA=./k7-ca.crt
 K7_SANDBOX_NAME=lc-agent
 K7_SANDBOX_IMAGE=alpine:latest
 K7_NAMESPACE=default
@@ -52,7 +53,9 @@ SANDBOX_NAME = os.getenv("K7_SANDBOX_NAME", "lc-agent")
 SANDBOX_IMAGE = os.getenv("K7_SANDBOX_IMAGE", "alpine:latest")
 SANDBOX_NAMESPACE = os.getenv("K7_NAMESPACE", "default")
 
-k7 = Client(endpoint=K7_ENDPOINT, api_key=K7_API_KEY)
+K7_API_CA = os.getenv("K7_API_CA", "./k7-ca.crt")  # cluster CA from /etc/k7/tls/ca.crt on the node
+
+k7 = Client(endpoint=K7_ENDPOINT, api_key=K7_API_KEY, verify_ssl=K7_API_CA)
 _sb: Optional[SandboxProxy] = None
 
 def ensure_sandbox_ready(timeout_seconds: int = 60) -> SandboxProxy:

@@ -16,6 +16,8 @@ description: "Five-minute quickstart, install from a release tarball or build fr
   `/run/k7d/`.
 - Optional: **k3s**, if you want pods scheduled as k7d microVMs via
   [`runtimeClassName: k7`](/k7d/guides/runtime-class).
+- Optional: the pinned **Firecracker + jailer** (`utils/install-firecracker.sh`,
+  v1.16.1, sha-verified) if you want the [`k7-fc` backend](/k7d/concepts/backends).
 
 `k7d doctor` runs exactly these checks without starting a daemon:
 
@@ -59,20 +61,22 @@ Overrides: `K7D_RELEASE_URL` (tarball), `K7D_PREFIX` (default
 ## Install from a release tarball
 
 Each release ships a self-contained tarball with the daemon, the
-containerd shim, the guest kernel, the guest initramfs, and an installer.
+containerd shim, the guest kernel, the guest initramfs, the guest
+docker payload, and an installer.
 
 ```bash
-tar xzf k7d-v0.4.0-x86_64-linux.tar.gz
-cd k7d-v0.4.0-x86_64-linux
+tar xzf k7d-v0.6.0-x86_64-linux.tar.gz
+cd k7d-v0.6.0-x86_64-linux
 sudo ./install.sh
 ```
 
 The installer:
 
 - copies `k7d` and `containerd-shim-k7-v1` to `/usr/local/bin`
-  (override with `--prefix DIR`),
-- copies the guest kernel (`vmlinux`) and initramfs to
-  `/usr/local/share/k7d`,
+  (override with `--prefix DIR`) and the shim's static `runc.amd64` to
+  `/opt/k7d`,
+- copies the guest kernel (`vmlinux`), initramfs, and docker payload
+  to `/usr/local/share/k7d` (payload under `docker/`),
 - writes a `k7d.service` systemd unit that points `K7D_KERNEL` /
   `K7D_INITRD` at those assets, sets `RUST_LOG=info`, and raises
   `LimitNOFILE` to 524288 (the 1024 soft default is far too low for
@@ -95,18 +99,30 @@ already owns the socket path — it never displaces a running instance.
 
 ### Registering with k3s
 
-If the host runs k3s and you want `runtimeClassName: k7`, add
+If the host runs k3s and you want `runtimeClassName: k7` (and `k7-fc`), add
 `--with-k3s`:
 
 ```bash
 sudo ./install.sh --with-k3s
 ```
 
-This registers the `k7` runtime in the k3s containerd config template,
-restarts k3s, and applies the RuntimeClass. The
+This registers the `k7` and `k7-fc` runtimes in the k3s containerd config
+template (the latter through `ConfigPath = /etc/k7d/shim-k7-fc.toml`),
+restarts k3s, and applies both RuntimeClasses (`k7-fc` with its
+`32Mi` / `50m` PodOverhead). It refuses to continue if either block
+carries `BinaryName`. The
 [RuntimeClass guide](/k7d/guides/runtime-class) explains each step if you
-prefer to do it by hand — or need to know why the config must not set
-`BinaryName`.
+prefer to do it by hand. `k7-fc` pods additionally need the pinned
+Firecracker binaries:
+
+```bash
+sudo bash utils/install-firecracker.sh   # reads guest/fc/pins.env, verifies every sha256
+```
+
+<Note>
+k7d **0.6.0** ships the Firecracker engine, the in-guest Docker service,
+and the shim hardening rules. Use that tarball (or newer), not 0.5.0.
+</Note>
 
 ## Build from source
 
@@ -119,12 +135,12 @@ make release    # daemon, shim, guest kernel, rootfs → dist/
 
 `make release` produces the same tarball layout under
 `dist/k7d-v<version>-x86_64-linux/` (daemon, shim, `vmlinux`,
-`initramfs.cpio.gz`, `runc.amd64`, `install.sh`, `quickstart.sh`) plus
-the `.tar.gz` — run `sudo ./install.sh` from there, or start the daemon
-directly for a quick look:
+`initramfs.cpio.gz`, `runc.amd64`, `docker/`, `install.sh`,
+`quickstart.sh`) plus the `.tar.gz` — run `sudo ./install.sh` from
+there, or start the daemon directly for a quick look:
 
 ```bash
-cd dist/k7d-v0.4.0-x86_64-linux
+cd dist/k7d-v0.6.0-x86_64-linux
 sudo K7D_KERNEL=$PWD/vmlinux K7D_INITRD=$PWD/initramfs.cpio.gz RUST_LOG=info ./k7d &
 ```
 
@@ -133,6 +149,15 @@ Without `K7D_KERNEL` / `K7D_INITRD` it refuses to create a VM rather than
 guessing. [`HACKING.md`](https://github.com/katakate/k7d/blob/main/HACKING.md)
 covers the remote-node development loop, the verification suite, and the
 kubectl integration tests.
+
+### What else ships in the tree
+
+Since 0.5.0 the public repository also carries `gym/` (the RL gym — lease,
+fork, prepare, score, scenario packs with a scripted runtime; see
+[GRPO](/k7d/guides/grpo)) and `utils/kvm-dilation/` (the carried KVM
+continuous ×N dilation patch with install/revert scripts; see
+[Time warp](/k7d/guides/time-warp)). `make helm-pin` installs the pinned
+helm v3.16.4 used for Ubuntu Cilium/Tetragon bring-up.
 
 ### Ubuntu node images
 
@@ -176,8 +201,11 @@ fork_batch, protect, prune, auto_evict under RAM budgets.
 <Card title="Time warp" icon="forward-fast" href="/k7d/guides/time-warp">
 Compress idle guest time with lockstep jumps or ×N dilation.
 </Card>
-<Card title="RuntimeClass k7" icon="dharmachakra" href="/k7d/guides/runtime-class">
-Schedule Kubernetes pods as k7d microVMs.
+<Card title="RuntimeClass k7 / k7-fc" icon="dharmachakra" href="/k7d/guides/runtime-class">
+Schedule Kubernetes pods as k7d microVMs — native engine or jailed Firecracker.
+</Card>
+<Card title="Backends" icon="fire" href="/k7d/concepts/backends">
+Native rust-vmm vs stock Firecracker under the jailer: selection, matrix, fork mechanics.
 </Card>
 <Card title="How CoW fork works" icon="bolt" href="/k7d/concepts/cow-fork">
 Why a fork costs ~5 ms and dirty pages, not full guest RAM.
