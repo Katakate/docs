@@ -8,7 +8,7 @@ description: "Root and /health endpoints"
 Endpoint: `GET /`
 
 ```bash
-curl "$BASE/"
+curl --cacert "${K7_API_CA:-./k7-ca.crt}" "$BASE/"
 ```
 
 Example:
@@ -22,7 +22,7 @@ Example:
 Endpoint: `GET /health`
 
 ```bash
-curl "$BASE/health"
+curl --cacert "${K7_API_CA:-./k7-ca.crt}" "$BASE/health"
 ```
 
 Example:

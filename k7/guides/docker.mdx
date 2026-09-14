@@ -11,15 +11,10 @@ Some workloads need more than a shell — they need `docker build`, `docker run`
 - Everything runs **inside the sandbox VM** — the isolation boundary is the VM, not the container.
 
 ```bash
-k7 create --docker --backend k7d ubuntu:24.04 builder
-k7 shell builder
-
-# Inside the sandbox:
-docker info | grep 'Storage Driver'    # overlay2
-docker pull alpine:3.21
-docker build -t myapp .
-docker run --rm myapp
-docker compose up
+k7 create --docker --backend k7d --egress-open builder ubuntu:24.04
+k7 exec builder -- docker info | grep 'Storage Driver'   # overlay2
+k7 exec builder -- docker pull alpine:3.21
+# Interactive `k7 shell` is node-local; from a laptop keep using exec.
 ```
 
 Or in YAML / the API:

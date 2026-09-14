@@ -16,8 +16,7 @@ order:
 2. `K7_API_URL` / `K7_API_KEY` / `K7_API_CA` environment variables.
 3. `~/.config/k7/config.toml` — written by `k7 config set api.url ...` /
    `k7 config set api.key ...` / `k7 config set api.ca ...`.
-4. On a cluster node only: `/etc/k7/api_endpoint`, `/etc/k7/tls/ca.crt`, and
-   the first entry of `/etc/k7/api_keys.json`.
+4. On a cluster node only: `/etc/k7/api_endpoint` and `/etc/k7/tls/ca.crt`. The API **key** is never stored in the clear on disk — paste the token `k7 generate-api-key` printed into `k7 config set api.key`.
 
 ```bash
 # One-time setup on your laptop. The default install mints a cluster CA;
@@ -25,7 +24,8 @@ order:
 scp root@node:/etc/k7/tls/ca.crt ./k7-ca.crt
 k7 config set api.url   https://<node-ip>:31007
 k7 config set api.ca    ./k7-ca.crt
-k7 config set api.key   $(ssh root@node 'jq -r ".[0].token" /etc/k7/api_keys.json')
+k7 config set api.key   '<paste-the-key-k7-generate-api-key-printed>'
+# Do NOT jq /etc/k7/api_keys.json — that file stores SHA-256 hashes, not the raw token.
 
 # Then everything Just Works without SSH'ing to the node.
 k7 list
@@ -70,7 +70,7 @@ Install K7 components on host node(s).
 
 ```bash
 k7 install [-v]                                # localhost, default kata backends
-k7 install --backend kfd,kql,k7d,k7d-fc        # all four backends (k7d release pinned by the playbook)
+k7 install --backend kfd,kql,k7d,k7d-fc       # Kata + k7d + jailed Firecracker
 k7 install --backend k7d --k7d-artifact /root/k7d-v0.6.0-x86_64-linux.tar.gz
 k7 install -i inventory.ini --ha               # multi-node HA (3+ servers)
 k7 install --role agent --join https://master:6443 --join-token TOKEN
@@ -120,12 +120,17 @@ k7 create --name my-sb --image alpine:latest \
 k7 create --name open --image alpine:latest --egress-open
 
 # Docker inside the sandbox (pinned dockerd, overlay2 on a 20Gi block disk)
-k7 create --docker --backend k7d --docker-disk 40Gi builder ubuntu:24.04
+k7 create --docker --backend k7d --egress-open --docker-disk 40Gi builder ubuntu:24.04
 
 # Ingress: deny-all by default; open a port to one peer sandbox, then publish it
 k7 create --ingress-port 8000 --ingress-from sandbox:frontend api python:3.12-slim
 k7 create --ingress-port 8000 --ingress-from cidr:203.0.113.0/24 --expose-port 8000 web python:3.12-slim
 # 🌐 Port 8000 exposed at http://<node-ip>:31234
+# That IP is the node *running* the pod (`externalTrafficPolicy: Local`).
+# Curling a different node — including the first master — will not answer.
+# python:3.12-slim is not a web server; start one with
+# `--before-script 'nohup python3 -m http.server 8000 >/tmp/http.log 2>&1 &'`
+# (k7d/kfd pid 1 is sleep 365d; a bare `&` is killed when before_script exits).
 ```
 
 ## pause
@@ -294,7 +299,7 @@ If using package managers that require root (e.g., `apk add`, `apt-get install`)
 ```bash
 k7 list [-n NAMESPACE]
 ```
-Lists sandboxes with status, readiness, restarts, age, image, backend, node, and the NodePorts allocated by `--expose-port` (empty when the sandbox is not exposed).
+Lists sandboxes with status, readiness, restarts, age, image, backend, node, and the NodePorts allocated by `--expose-port` (empty when the sandbox is not exposed). The table truncates names; `k7 exec NAME` still needs the full name you passed to `create`.
 
 ## delete
 
@@ -315,7 +320,20 @@ Deletes all sandboxes in a namespace (with confirmation).
 ```bash
 k7 shell NAME [-n NAMESPACE]
 ```
-Opens an interactive shell in the sandbox pod.
+Opens an interactive shell in the sandbox pod. This is **node-local**
+(`kubectl exec`); it does not go through the K7 API. From a laptop use
+`k7 exec NAME -- 'echo hello'` — the CLI joins the command and the API
+runs it under `sh -c`, so pass redirects as **one** quoted string
+(`k7 exec NAME -- 'echo hi > /tmp/state.txt'`). Do not add an extra `sh -c`
+or the quotes are lost.
+
+## exec
+
+```bash
+k7 exec NAME -- COMMAND...
+k7 exec demo -- echo hello
+k7 exec demo -- 'echo hi > /tmp/state.txt'
+```
 
 ## logs
 

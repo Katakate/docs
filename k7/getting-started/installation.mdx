@@ -3,14 +3,14 @@ title: "Quickstart"
 description: "Install k7, prepare your node, start the API, and run your first sandbox"
 ---
 
-Katakate (k7) lets you run secure VM sandboxes on Kubernetes — Firecracker, QEMU + Longhorn, or [k7d](/k7d/index) (natively or under the Firecracker jailer). This Quickstart gets you from zero to a working sandbox via CLI and Python SDK.
+k7 lets you run secure VM sandboxes on Kubernetes — Firecracker, QEMU + Longhorn, or [k7d](/k7d/index) (natively or under the Firecracker jailer). This Quickstart gets you from zero to a working sandbox via CLI and Python SDK.
 
 <Note>
 If you already installed k7 previously, consider running `make uninstall` before reinstalling to avoid stale cached files in a previous `.deb`.
 </Note>
 
 <Note>
-These pages track **k7 0.3.0** (HTTPS-by-default, `--docker`, `k7d-fc`, Cilium isolation). The playbook pins [k7d 0.6.0](https://github.com/Katakate/k7d/releases/tag/v0.6.0). Older PPA packages (0.2.2 and earlier) still serve the API over plain HTTP and pin an older k7d. Read the [CHANGELOG](https://github.com/Katakate/k7/blob/main/CHANGELOG.md).
+These pages track **k7 0.3.1** (HTTPS-by-default, `--docker`, `k7d-fc`, Cilium isolation; HA Firecracker-pin copy). The playbook pins [k7d 0.6.0](https://github.com/Katakate/k7d/releases/tag/v0.6.0). Older PPA packages (0.2.2 and earlier) still serve the API over plain HTTP and pin an older k7d. Read the [CHANGELOG](https://github.com/Katakate/k7/blob/main/CHANGELOG.md).
 </Note>
 
 ## Requirements
@@ -36,25 +36,30 @@ sudo apt install -y ansible
 Tested setup: Hetzner Robot dedicated, Ubuntu 24.04, with a **spare raw NVMe** for the `kfd` thin-pool. Dual-NVMe boxes (no third drive): put Ubuntu on **one** disk (`SWRAID 0`) and leave the other raw — see [Hetzner node setup](https://github.com/Katakate/k7/blob/main/tutorials/k7_hetzner_node_setup.md). Do **not** pin `--disk /dev/nvme1n1`: NVMe names swap across reboots; the playbook auto-detects the empty non-root disk.
 </Info>
 
-## Install the CLI (APT)
+## Install the CLI
 
-Install the `k7` CLI on the node(s) that will host the VM sandboxes:
+The Launchpad PPA currently publishes **0.2.2**. These pages track **0.3.1** — install the [GitHub release `.deb`](https://github.com/Katakate/k7/releases/tag/v0.3.1):
 
 ```bash
-sudo add-apt-repository ppa:katakate.org/k7
-sudo apt update
-sudo apt install k7
+curl -fsSL -O https://github.com/Katakate/k7/releases/download/v0.3.1/k7_0.3.1_amd64.deb
+sudo apt install ./k7_0.3.1_amd64.deb
 ```
+
+When Launchpad catches up, `sudo add-apt-repository ppa:katakate.org/k7 && sudo apt update && sudo apt install k7` will install 0.3.1 too. Confirm with `k7 -V`.
 
 ## Install K7 on your node(s)
 
-`k7 install` with no flags provisions **both Kata backends** (`kfd` + `kql`) on localhost. Add `k7d` explicitly for the warm-fork microVM runtime, and `k7d-fc` for the same runtime under the Firecracker jailer. The playbook pins [k7d 0.6.0](https://github.com/Katakate/k7d/releases/tag/v0.6.0):
+`k7 install` builds the `k7-api:local` image from the **current working directory**. Clone the matching tag and run the installer from that checkout (Ansible + Docker are required — see Requirements above):
 
 ```bash
-k7 install --backend kfd,kql,k7d,k7d-fc
+git clone --branch v0.3.1 https://github.com/Katakate/k7.git
+cd k7
+k7 install --backend kfd,kql,k7d
 ```
 
-That installs and wires up Kubernetes (K3s), Cilium, Kata, Firecracker + Jailer + thin-pool (`kfd`), QEMU + Longhorn (`kql`), the k7d daemon + `RuntimeClass k7` (`k7d`), and pinned upstream Firecracker v1.16.1 + `RuntimeClass k7-fc` (`k7d-fc`). It also deploys the `k7-api` over HTTPS with a cluster CA. Pass `-v` for verbose output. Two-node / HA inventories: [Multi-node clusters](/k7/guides/multi-node); install-time security knobs (`--api-allow-cidr`, `--api-hostname`, `--hubble`): [CLI reference](/k7/guides/cli#install).
+`k7 install` with no flags provisions **both Kata backends** (`kfd` + `kql`) on localhost. Add `k7d` for the warm-fork microVM runtime and `k7d-fc` for jailed Firecracker (0.3.1 copies the Firecracker pins from the repo root). The playbook pins [k7d 0.6.0](https://github.com/Katakate/k7d/releases/tag/v0.6.0).
+
+That installs and wires up Kubernetes (K3s), Cilium, Kata, Firecracker + Jailer + thin-pool (`kfd`), QEMU + Longhorn (`kql`), and the k7d daemon + `RuntimeClass k7` (`k7d`). It also deploys the `k7-api` over HTTPS with a cluster CA. Pass `-v` for verbose output. Two-node / HA inventories: [Multi-node clusters](/k7/guides/multi-node); install-time security knobs (`--api-allow-cidr`, `--api-hostname`, `--hubble`): [CLI reference](/k7/guides/cli#install).
 
 ![Example output: k7 install](/k7/images/ex-install.png)
 
@@ -92,7 +97,7 @@ k7 config set api.ca  ./k7-ca.crt
 k7 config set api.key <key>          # from the next step
 ```
 
-If you installed with `--api-hostname k7.example.com`, the certificate is publicly trusted and `api.ca` is unnecessary. On the node itself the CLI finds `/etc/k7/api_endpoint` and `/etc/k7/tls/ca.crt` automatically.
+If you installed with `--api-hostname k7.example.com`, the certificate is publicly trusted and `api.ca` is unnecessary. On the node itself the CLI finds `/etc/k7/api_endpoint` and `/etc/k7/tls/ca.crt` automatically; you still have to `k7 config set api.key` with the token `generate-api-key` printed.
 
 ### Generate an API key
 
@@ -102,6 +107,15 @@ k7 generate-api-key tenant-a -n team-a    # scoped to one namespace (repeat -n)
 ```
 
 A scoped key cannot list or mutate another namespace, and cannot run all-namespaces operations. Keys without `-n` keep unrestricted access (backward compatible).
+
+**Save the printed key.** `k7 generate-api-key` stores only a hash in `/etc/k7/api_keys.json` — the raw token is shown once and is **not** auto-loaded on the node. Point the CLI at it (laptop or node):
+
+```bash
+k7 config set api.url https://<node-ip>:31007   # laptop; on the node this is auto-read from /etc/k7/api_endpoint
+k7 config set api.ca  ./k7-ca.crt                # laptop; on the node /etc/k7/tls/ca.crt is used automatically
+k7 config set api.key <the-printed-key>
+k7 list
+```
 
 ![Example: k7 generate-api-key](/k7/images/ex-generate-api-key.png)
 
@@ -128,14 +142,13 @@ Example `k7.yaml`:
 name: demo
 image: alpine:3.20
 namespace: default
-env_file: /root/secrets.env
+# env_file: /root/secrets.env   # optional; omit unless that file exists on the node
 limits:
   cpu: "100m"
   memory: "128Mi"
 before_script: |
   # Installing curl. Egress open during before_script, then restricted (empty whitelist) afterwards
   apk add curl
-  echo $ENV_VAR_1
 egress_whitelist: []
 ```
 
@@ -161,7 +174,8 @@ CLI `k7 create` with no `--egress` / `--egress-open` **blocks all egress**. An A
 ### Shell into your sandbox
 
 ```bash
-k7 shell demo
+k7 exec demo -- echo hello          # works from a laptop via the API
+k7 shell demo                      # interactive; node-local (needs kubectl)
 ```
 
 ![Example: k7 shell](/k7/images/ex-shell.png)

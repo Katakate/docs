@@ -136,7 +136,23 @@ ansible_ssh_private_key_file=~/.ssh/id_ed25519
 longhorn_replicas=2
 ```
 
-For a 3-node HA cluster with **all backends on every node**, one command from the first master brings everything up:
+For a 3-node HA cluster with **all backends on every node** (`kfd`, `kql`, `k7d`, `k7d-fc`), one command from the first master brings everything up. Clone [Katakate/k7](https://github.com/Katakate/k7) at `v0.3.1` on that master and run `k7 install` from the checkout (`k7-api:local` is built from cwd). Fresh nodes have no SSH host keys yet — either `ssh-keyscan` the peers into `known_hosts` or set `ansible_ssh_common_args` as below:
+
+```ini
+[k7_servers]
+k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
+k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
+k7-node-03 ansible_host=203.0.113.12 k7_backends=kfd,kql,k7d
+
+[k7_cluster:children]
+k7_servers
+
+[k7_cluster:vars]
+ansible_user=root
+ansible_ssh_private_key_file=/root/.ssh/id_ed25519
+ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+longhorn_replicas=3
+```
 
 ```bash
 k7 install -i inventory.ini --ha --k7d-version 0.6.0
@@ -146,10 +162,10 @@ Two-node (one server + one agent, **no `--ha`** — embedded etcd needs 3+ serve
 
 ```ini
 [k7_servers]
-k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d,k7d-fc
+k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
 
 [k7_agents]
-k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d,k7d-fc
+k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
 
 [k7_cluster:children]
 k7_servers
@@ -158,6 +174,7 @@ k7_agents
 [k7_cluster:vars]
 ansible_user=root
 ansible_ssh_private_key_file=/root/.ssh/id_ed25519
+ansible_ssh_common_args=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 longhorn_replicas=2
 ```
 

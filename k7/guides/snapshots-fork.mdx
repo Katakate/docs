@@ -43,6 +43,8 @@ Optional flags:
 
 The snapshot is **crash-consistent**: it captures the disk state at the moment of the snapshot, not the in-memory process state. The sandbox process is then terminated as the Deployment scales to 0.
 
+On a 3-node HA cluster with `longhorn_replicas=3`, a live crash-consistent clone can fail `fsck` when the child PVC is mounted (`UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY`). `k7 fork` then never goes Ready. Prefer **`k7d` warm fork** when you need a reliable clone; for kql, pause the sandbox (quiesce) before snapshotting, or keep a named snapshot taken after a pause rather than forking a busy volume.
+
 The snapshot is stored as a `VolumeSnapshot` object in the same namespace and persists until you delete it (`kubectl delete volumesnapshot <name>`).
 
 ## Resume
