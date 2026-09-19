@@ -17,6 +17,26 @@ Live copy-on-write fork requires parent and child memory to be mappings **in the
 
 If your threat model is "mutually hostile customers on shared hardware", run those pods on [RuntimeClass `k7-fc`](#firecracker-profile-k7-fc) — the same daemon and shim, but each VM is a stock Firecracker process in its own jail — put tenants on separate k7d hosts, or use K7's [kata-firecracker-devmapper backend](/k7/concepts/backends). If it is "thousands of copies of my own environment, some of which an agent will break on purpose", this design buys you the fork — and the jailer below keeps a rogue guest from reaching anything but its own bridge.
 
+## Privilege separation
+
+`k7d.service` starts one binary that forks itself in two **before** it allocates a thread or binds a socket. The shipped unit sets `K7D_PRIVSEP=on` (`off` is the escape hatch: one root process). `k7d doctor`'s `privsep:` section reports which it is. This is the daemon, not a third backend — both native and Firecracker VMs go through the same pair.
+
+| Process | Identity | Holds | Its input |
+|---|---|---|---|
+| **Node broker** | uid 0, the measured capability bounding set, seccomp `NODE_SYSCALLS` | TAP/bridge/`nft`/CNI netns, `mount`/`umount2` for shares, the Firecracker jailer and its uid leases, `chown`/`link` into jails, `SIGKILL` of jailed pids | **Only** the VM broker, over a `SOCK_SEQPACKET` socketpair created before the fork. No listening socket. Its request type is a closed enum of ids — there is no `exec`, `mount(source, target)`, or `write_file` verb. |
+| **VM broker** | uid `k7d`, empty capability set, `NoNewPrivs=1`, seccomp `VM_SYSCALLS` | `/run/k7d/k7d.sock` and its parser, guest agent clients, vCPU threads and every virtio device model, snapshot trees | The shim, the guest agents, guest virtio descriptor chains, FUSE traffic. Everything attacker-influenced. |
+| **Helper spawner** | uid `k7d`, no capabilities, seccomp `HELPER_SYSCALLS` | `execve` of helpers that need no capability (`mkfs.ext4`, `mkfs.erofs`, `cp --reflink`) | The VM broker |
+
+A guest that gets out of KVM and out of the device models lands in a process that cannot mount, cannot create a network device, cannot write another uid's cgroup, and cannot regain a capability through a setuid binary. What it can do is send the node broker one of a closed set of verbs, each naming an id the node broker already registered — never a path.
+
+Paths cross exactly once, at `vm.register`, before any disk is provisioned. Each is checked against a per-class root allowlist and resolved with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`, then pinned as an `O_PATH` descriptor. `/tmp` is never a root on its own — only the `/tmp/k7d-shim-<sandbox>` family.
+
+Crash coupling is total: a VM-broker death makes the node broker release every registered id and exit non-zero so systemd replaces the pair. Native vCPU threads run *in* the VM broker (a crash kills native VMs). Standalone Firecracker pods can survive a VM-broker restart (`K7D_VM_BROKER_RESTART`, ships off).
+
+`packaging/install.sh` creates the `k7d` account (system user, `nologin`, member of `kvm`) and installs `60-k7d.rules` so `/dev/vhost-vsock` is group `kvm` — that membership, not a capability, is what lets the unprivileged VM broker open `/dev/kvm` and `/dev/vhost-vsock`. `/var/lib/k7d/fc` stays root `0700`.
+
+Full table and bounding-set rationale: [k7d SECURITY.md](https://github.com/Katakate/k7d/blob/main/SECURITY.md#privilege-separation).
+
 ## The tree jailer
 
 Every live cluster payload — a root, a fork, an adopted cluster — owns one bridge, and every guest on every bridge sits in the same `10.200.0.0/24`. The jailer is the set of host-side controls that scope a tree to itself. All of them are on by default and every escape hatch is an explicit env var that logs a warning; an unrecognised value is a hard error, never a silent fallback.
@@ -40,7 +60,14 @@ Each tree gets a threaded cgroup for its vCPU and device threads (`pids.max`) an
 
 ### Daemon seccomp
 
-k7d is one process, so one seccomp allowlist installed before any VM exists covers every tree. The `ioctl` surface is matched by driver type byte (KVM, vhost, TUN, `FICLONE`, block, loop, XFS) rather than by enumerating request numbers. The filter survives `execve`, so it also covers the helpers the daemon spawns (`virtiofsd`, `nft`, `ip`, `iptables`). Default `enforce`; `K7D_SECCOMP=log` records instead of killing.
+k7d is **two processes** when `K7D_PRIVSEP=on` (the shipped default): the node broker and the VM broker each install their own seccomp allowlist (`NODE_SYSCALLS` / `VM_SYSCALLS`) before any VM exists. The `ioctl` surface is matched by driver type byte (KVM, vhost, TUN, `FICLONE`, block, loop, XFS) rather than by enumerating request numbers. The filter survives `execve`, so it also covers helpers (`virtiofsd`, `nft`, `ip`, `iptables`). Default `enforce`; `K7D_SECCOMP=log` records instead of killing.
+
+`k7d doctor` run from a **login shell** reports `privsep: K7D_PRIVSEP off` because that process is not the daemon. Check the unit and the process table instead:
+
+```bash
+systemctl show k7d -p Environment | grep K7D_PRIVSEP   # K7D_PRIVSEP=on
+ps -eo user,pid,cmd | grep '[k]7d'                     # uid 0 node broker + two uid-k7d helpers
+```
 
 ### virtiofsd sandbox
 
@@ -52,7 +79,7 @@ The [Ubuntu node image](/k7d/guides/ubuntu-nodes#guest-hardening) ships AppArmor
 
 ## Guest-controlled paths
 
-The guest is attacker-controlled from its first instruction, while the shim and daemon run as host root. Every host filesystem operation whose *path* the guest can influence follows four rules:
+The guest is attacker-controlled from its first instruction. The shim still runs as host root; with `K7D_PRIVSEP=on` the process that parses guest and shim input is the uid-`k7d` VM broker. Every host filesystem operation whose *path* the guest can influence follows four rules:
 
 1. No `create`, `mkdir`, `open(O_CREAT)`, `rename`, `unlink`, `chown`, `copy`, or `mount` under a guest-writable directory unless the final component is opened relative to a share-root fd with `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, and an existing entry is an **error**, never reused.
 2. Anything attached to more than one VM is read-only and host-enforced (`O_RDONLY` + write requests rejected) — never "read-only because the guest mounts it `ro`".
@@ -71,7 +98,7 @@ The shim strips only what the guest kernel cannot honour: `process.apparmorProfi
 
 ## Control socket
 
-`/run/k7d/k7d.sock` is owned by the daemon (host root). `serve` creates the parent directory at `0750` and the socket at `0660` (`root:root`); it never tightens a world-writable sticky parent, so keep it in `/run/k7d`, not `/tmp`. A process that can connect can create, stop, and fork every VM on the node — the same power as a compromised shim. `K7D_ALLOWED_UIDS=0,1000` refuses connections from any other uid (`SO_PEERCRED`), and mutating ops (`create_vm`, `stop_vm`, `fork_vm`, tree writes, `delete_data_disk`, …) log the peer's uid/gid/pid at `info`. This is an audit trail and a floor, not an auth system.
+`/run/k7d/k7d.sock` is held by the **VM broker** (uid `k7d`) when privilege separation is on. `serve` creates the parent directory at `0750` and the socket at `0660`; it never tightens a world-writable sticky parent, so keep it in `/run/k7d`, not `/tmp`. A process that can connect can create, stop, and fork every VM on the node — the same power as a compromised shim. `K7D_ALLOWED_UIDS=0,1000` refuses connections from any other uid (`SO_PEERCRED`), and mutating ops (`create_vm`, `stop_vm`, `fork_vm`, tree writes, `delete_data_disk`, …) log the peer's uid/gid/pid at `info`. This is an audit trail and a floor, not an auth system.
 
 ## Firecracker profile (`k7-fc`)
 
@@ -80,7 +107,7 @@ The shim strips only what the guest kernel cannot honour: `process.apparmorProfi
 | | What |
 |---|---|
 | **Gained** | The VMM is out of the daemon's address space. Each VM has its own uid, chroot, pid namespace, cgroup, and Firecracker's default seccomp. A guest → VMM escape lands in that jail, not in `k7d`. |
-| **Unchanged** | The daemon is still host root and still one process (control socket, TAP/bridge, vsock proxy, tree bookkeeping). The shim still rewrites the OCI spec — the guest-controlled-path rules above are the floor for both backends. Network is still the daemon's bridge. Sibling CoW forks of one tree still share the daemon. |
+| **Unchanged** | The daemon is still the one host component both backends share (control socket, TAP/bridge, vsock proxy, tree bookkeeping). [Privilege separation](#privilege-separation) splits *which of its processes* holds root, not which host owns the work. The shim still rewrites the OCI spec — the guest-controlled-path rules above are the floor for both backends. Network is still the daemon's bridge. Sibling CoW forks of one tree still share the daemon. |
 | **Lost** | Time warp, dilation, autowarp. virtiofs / hostPath (Create fails with `backend firecracker has no virtiofs`). Native `MAP_PRIVATE` fork latency. |
 
 `runtimeClassName: k7` stays the native in-process VMM; `k7d.katakate.org/backend: firecracker` on a `k7` pod is the per-pod opt-in, and `k7-fc` is the admission-gateable default. An explicit `backend: native` on `k7-fc` is a loud Create error.
@@ -112,7 +139,7 @@ What doesn't: TCP to the outside world (the far end never forked). Forks keep th
 ## Current limitations
 
 - **Single host, x86_64 Linux + KVM only.** Cross-node fork is on the roadmap. Does not build on macOS/Windows.
-- **The daemon runs as root** (KVM, TAP, bridge, nftables, and cgroup setup require it). The control socket is a local Unix socket (`0660`, optional `K7D_ALLOWED_UIDS`) — protect host access to it.
+- **The node broker runs as root** (KVM, TAP, bridge, nftables, and cgroup setup require it). With `K7D_PRIVSEP=on` (the shipped default) the process that parses guest and shim input is uid `k7d` with an empty capability set; the root half has no listening socket. The control socket is still a local Unix socket (`0660`, optional `K7D_ALLOWED_UIDS`) — protect host access to it.
 - **Young project.** One primary test machine, no external security audit yet. Small surface by design, but treat it accordingly.
 
 ## Reporting a vulnerability

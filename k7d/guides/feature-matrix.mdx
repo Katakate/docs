@@ -61,7 +61,7 @@ This is the outer layer: kubectl on the host schedules pods into k7d microVMs vi
 | Warm VM + whole-cluster fork / snapshot tree | ✅ Today | The point of the project |
 | Init containers; natural exit / `restartPolicy` | ✅ Today | Multi-container pods |
 | Multi-vCPU guests (`cpu: "2"+`) | ✅ Today | vCPU count derived from the pod's CPU limit; fork/snapshot parity |
-| Pause / resume a pod's VM | ✅ Today | `pause_vm` / `resume_vm`; CID and memory retained. On `k7-fc`, CRI exec after a pause/resume cycle has been observed to hang |
+| Pause / resume a pod's VM | ✅ Today | `pause_vm` / `resume_vm`; CID and memory retained. On `k7-fc`, resume→exec needs Firecracker **v1.16.2+** (v1.16.1 gated vsock RX after a bare resume) |
 | Time warp / dilation / autowarp | ✅ Today | `k7` only — unsupported on `k7-fc` (named error) |
 | `hostNetwork`, NetworkPolicy, IPv6, arbitrary CSI / RWX | 🔜 Later | Host RuntimeClass only — in-cluster Cilium NetworkPolicy and Longhorn RWX are the rows above |
 | Cross-node fork | 🔮 Later | Host-local trees today |

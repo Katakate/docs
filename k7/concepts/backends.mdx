@@ -30,6 +30,8 @@ A **backend** in Katakate combines a VM runtime with a storage driver. There are
 
 Numbers are medians of 3 on one Hetzner AX41 node; ranges and methodology are in [PERFORMANCE.md](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md).
 
+**Privilege separation** is the k7d daemon, not a fifth backend: a root node broker (no listening socket) plus a uid-`k7d` VM broker for the whole node. Both `k7d` and `k7d-fc` sandboxes go through that pair. Tables: [k7d vs k7d-fc](/k7d/concepts/backends#k7d-vs-k7d-fc) and [privilege separation](/k7d/concepts/security#privilege-separation).
+
 ## Choosing a backend
 
 Pick **`kata-firecracker-devmapper`** when:
@@ -70,15 +72,14 @@ See the [K7d documentation](/k7d/index) for the runtime's own concepts, API, and
 ### At install time
 
 ```bash
-k7 install                                     # default: kata backends on localhost
-k7 install --backend kfd                       # kata-firecracker-devmapper only (auto-detects raw disk)
+k7 install --backend kfd                       # required --backend; kata-firecracker-devmapper only (auto-detects raw disk)
 k7 install --backend kfd --disk /dev/nvme2n1   # pin the thin-pool disk explicitly
 k7 install --backend kql                       # kata-qemu-longhorn only, no raw disk needed
 k7 install --backend kql --longhorn-extra-disk /mnt/longhorn-extra   # optional extra storage
 k7 install --backend k7d                       # k7d runtime (daemon + shim + RuntimeClass k7)
 k7 install --backend k7d,k7d-fc                # add pinned Firecracker + jailer and RuntimeClass k7-fc
-k7 install --backend k7d --k7d-version 0.6.0   # pin the k7d release (playbook default: 0.6.0)
-k7 install --backend k7d --k7d-artifact /root/k7d-v0.6.0-x86_64-linux.tar.gz   # install from a local tarball
+k7 install --backend k7d --k7d-version 0.7.0   # pin the k7d release (playbook default: 0.7.0)
+k7 install --backend k7d --k7d-artifact /root/k7d-v0.7.0-x86_64-linux.tar.gz   # install from a local tarball
 k7 install --backend kfd,kql --longhorn-extra-disk /mnt/longhorn-extra   # omit --disk on dual-NVMe (auto-detect)
 k7 install -i inventory.ini                    # multi-node, per-host backends
 k7 install -i inventory.ini --ha               # multi-master HA (3+ servers, embedded etcd)
@@ -87,16 +88,18 @@ k7 install -i inventory.ini --ha               # multi-master HA (3+ servers, em
 ### At sandbox creation time
 
 ```bash
-# Auto-detect (uses the only backend installed, or falls back to kfd if several)
-k7 create --image alpine:3.20 demo
+# Auto-detect (uses /etc/k7/backend on the API node, else kfd)
+k7 create demo alpine:3.20 --cpu 1 --memory 1Gi
 
 # Explicit
-k7 create --backend kql --image alpine:3.20 demo
-k7 create --backend k7d --image alpine:3.20 demo
-k7 create --backend k7d-fc --docker --image ubuntu:24.04 builder
+k7 create demo alpine:3.20 --backend kql --cpu 1 --memory 1Gi
+k7 create demo alpine:3.20 --backend k7d --cpu 1 --memory 1Gi
+k7 create builder ubuntu:24.04 --backend k7d-fc --docker --egress-open --cpu 2 --memory 3Gi
+```
 
-# In YAML
-# k7.yaml:
+In YAML:
+
+```yaml
 backend: kata-qemu-longhorn   # or kata-firecracker-devmapper, k7d, k7d-fc — or alias kql / kfd / k7-fc
 ```
 
@@ -136,9 +139,9 @@ If the requested backend isn't available on any node, you'll see a clear `Failed
 
 ### k7d-fc
 
-- Same daemon, shim, guest agent, and `--docker` service as `k7d`; pods use `runtimeClassName: k7-fc`. The daemon boots the guest on **upstream Firecracker v1.16.1 under the upstream jailer** (sha-pinned binaries installed to `/usr/local/bin` by the playbook — a different binary from Kata's `/opt/kata/bin` Firecracker used by `kfd`).
+- Same daemon, shim, guest agent, and `--docker` service as `k7d`; pods use `runtimeClassName: k7-fc`. The daemon boots the guest on **upstream Firecracker under the upstream jailer** (sha-pinned binaries installed to `/usr/local/bin` by the playbook — a different binary from Kata's `/opt/kata/bin` Firecracker used by `kfd`). k7 **0.4.0** and k7d both pin **v1.16.2**. k7 0.3.1 still vendored v1.16.1.
 - `k7 install --backend k7d-fc` writes `/etc/k7d/shim-k7-fc.toml` (`backend = "firecracker"`), registers containerd `runtimes.k7-fc` with a `ConfigPath` option (and no `BinaryName`), creates RuntimeClass `k7-fc` with a PodOverhead of `32Mi` / `50m`, and labels the node `k7.katakate.org/backend-k7d-fc=true` (plus `backend-k7d`, so native `k7d` pods still schedule there).
 - Fork and pause go through the same `/run/k7d/k7d.sock` verbs and `fork-source-*` annotations as `k7d`. Under the hood a fork is a Firecracker Diff snapshot materialised onto a reflinked base image and `LoadSnapshot`ed into a fresh jail (~2.5 s end-to-end via k7; ~2.45 s fork→exec measured).
 - **hostPath / PVC `volumes` are refused at create time** — Firecracker has no virtiofs. Time warp / dilation is unavailable on this backend.
-- Known issue: after `k7 pause` / `k7 resume`, CRI exec into a `k7d-fc` sandbox has been observed to hang on the current cut (k7d CHALLENGES #17). Pause itself returns in ~0.2 s; do not rely on resume→exec on `k7d-fc` yet.
+- Pause / resume → exec needs Firecracker **v1.16.2+**. k7 **0.4.0** copies v1.16.2. k7 0.3.1 still copied v1.16.1, which gated vsock RX after a bare resume (upstream #6100 / k7d CHALLENGES); current k7d then **fails `k7 resume` loudly** (`Firecracker < v1.16.2`). Native `k7d` is unaffected.
 - Requires k7d **0.6.0+** (Firecracker engine + `ConfigPath`). The stock 0.5.0 tarball does not know `ConfigPath` and the RuntimeClass will not come up.

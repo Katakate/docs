@@ -6,7 +6,7 @@ description: "One daemon, one shim, two VMMs — k7d's in-process rust-vmm engin
 k7d boots every VM through the same daemon and the same containerd shim. The **backend** is which VMM process owns the KVM fd:
 
 - **`native`** (default) — k7d's in-process rust-vmm VMM. The VM lives in the daemon's address space; warm fork is a `MAP_PRIVATE` CoW of guest memory (~5 ms). This is what every other k7d page describes.
-- **`firecracker`** — a stock, sha-pinned upstream [Firecracker](https://github.com/firecracker-microvm/firecracker) v1.16.1 process, launched under the stock `jailer`. Same guest kernel, initramfs, agent, protocol, fork/tree/pool verbs and Docker service; the VMM is the audited upstream binary and sits in its own uid, chroot, pid namespace, cgroup and seccomp filter.
+- **`firecracker`** — a stock, sha-pinned upstream [Firecracker](https://github.com/firecracker-microvm/firecracker) v1.16.2 process, launched under the stock `jailer`. Same guest kernel, initramfs, agent, protocol, fork/tree/pool verbs and Docker service; the VMM is the audited upstream binary and sits in its own uid, chroot, pid namespace, cgroup and seccomp filter. v1.16.2 over v1.16.1 is upstream [#6100](https://github.com/firecracker-microvm/firecracker/issues/6100): earlier 1.16.x gated vsock RX after a bare pause → resume, so CRI exec never answered.
 
 <Note>
 The Firecracker engine ships in **k7d 0.6.0** (`install.sh --with-k3s` registers RuntimeClass `k7-fc` and the `ConfigPath` runtime option). The 0.5.0 tarball does not.
@@ -44,11 +44,67 @@ spec:
       command: ["sleep", "infinity"]
 ```
 
+## k7d vs k7d-fc
+
+That is **not** “bare VM vs RuntimeClass.” Both surfaces run on either VMM. Privilege separation is the daemon, not a third backend: one node broker (root, no listening socket) plus one VM broker (uid `k7d`, empty caps) for the whole node. See [Privilege separation](/k7d/concepts/security#privilege-separation).
+
+| | **native** (`k7d`) | **firecracker** (`k7d-fc`) |
+|---|---|---|
+| Pick on the socket | `backend: native` (default) | `backend: firecracker` |
+| Kubernetes RuntimeClass | `runtimeClassName: k7` | `runtimeClassName: k7-fc` |
+| VMM | k7d's in-process rust-vmm | stock Firecracker v1.16.2 + jailer |
+| Per-VM jail (own uid, chroot, seccomp) | ❌ | ✅ |
+| Independently audited VMM | ❌ | ✅ |
+| Privilege split (root node broker / uid-`k7d` VM broker) | ✅ same daemon | ✅ same daemon |
+| virtiofs | ✅ | ❌ |
+| Built for | RL, gym, fleets you control | multi-tenant / hostile guests |
+
+**Bare VM / tree / gym** (daemon API — not a Kubernetes RuntimeClass):
+
+| | native | firecracker |
+|---|---|---|
+| Warm VM fork | ✅ **~5–50 ms** | ✅ **~76–140 ms** / child |
+| Whole-cluster fork | ✅ | ✅ |
+| Snapshot tree / warm pool | ✅ | ✅ |
+| Guest time warp / ×N dilation | ✅ | ❌ |
+| Lockstep cluster pause | ✅ | ⚠️ parallel pause (µs skew) |
+
+**Kubernetes RuntimeClass pods** (host `runtimeClassName` — not the gym):
+
+| | `k7` (native) | `k7-fc` (firecracker) |
+|---|---|---|
+| `kubectl logs` / `exec` | ✅ | ✅ |
+| hostPath (virtiofs) | ✅ | ❌ |
+| docker-in-guest | ✅ | ✅ |
+| Pause / resume → exec | ✅ | ✅ on Firecracker **v1.16.2+** (v1.16.0/v1.16.1 gated vsock RX after resume) |
+
+### k7d-fc vs forkd
+
+Both wrap Firecracker and CoW-fork guest RAM. [forkd](https://github.com/deeplethe/forkd) is a sandbox fan-out. `k7d-fc` is k7d's tree / cluster / RuntimeClass product with Firecracker swapped in as the VMM.
+
+| | **k7d-fc** | **forkd** |
+|---|---|---|
+| Stock Firecracker (no patch) | ✅ | ❌ vendored FC for live BRANCH (`MAP_SHARED` + UFFD) |
+| Stock jailer (uid, chroot, seccomp) | ✅ always | ❌ drives the API socket; no jailer |
+| Whole-cluster fork | ✅ | ❌ one sandbox VM |
+| Snapshot tree / RAM+disk budget | ✅ daemon API | ⚠️ snapshot tag + branch |
+| Kubernetes RuntimeClass | ✅ `k7-fc` | ❌ |
+| Privilege-separated daemon | ✅ | ❌ |
+| Warm fork of a running VM | ✅ **~76–140 ms** / child | ✅ **~56–150 ms** BRANCH |
+| 100 children from one snapshot | ❌ jailer spawn per child | ✅ **~100 ms** (`mmap MAP_PRIVATE`) |
+| Live BRANCH (source barely pauses) | ❌ Diff snapshot + `LoadSnapshot` | ✅ v0.4 UFFD-WP (needs the FC patch) |
+| Guest time warp / ×N dilation | ❌ | ❌ |
+| Built for | k7d tree + hostile guests | agent sandbox fan-out |
+
+Native k7d (~5 ms in-process fork) is a different mechanism — do not compare that number to forkd. `k7d-fc` pays the jailer on every child so a guest→VMM bug dies in the jail, not in a patched VMM.
+
+Native is the default and the 250 ms latency suite. Use Firecracker when the guest might try to escape — especially multi-tenant `--docker`. Asking for virtiofs or time warp on the Firecracker backend fails Create loudly; nothing is silently dropped.
+
 ## Feature matrix
 
 | Feature | Native (`k7`) | Firecracker (`k7-fc`) |
 |---|---|---|
-| VMM | in-process rust-vmm | stock Firecracker v1.16.1 under the stock jailer (sha-pinned) |
+| VMM | in-process rust-vmm | stock Firecracker v1.16.2 under the stock jailer (sha-pinned) |
 | Guest → host boundary | KVM | KVM + jailer (uid, chroot, pid ns, cgroup) + Firecracker seccomp |
 | Agent | vsock | vsock (Unix socket inside the jail, same protocol) |
 | Rootfs | erofs on virtio-blk | erofs on virtio-blk (Firecracker drives) |
@@ -94,7 +150,7 @@ Most of the per-child cost is staging a chroot, leasing a uid, spawning `jailer`
 | | |
 |---|---|
 | **Gained** | The VMM is out of the daemon's address space. A guest → VMM escape lands in a per-VM uid, chroot, pid namespace, cgroup and Firecracker's seccomp filter — not in `k7d`. |
-| **Unchanged** | The daemon is still host root and still one process (control socket, TAP/bridge, vsock proxy, tree bookkeeping). The shim still rewrites the OCI spec, and the [guest-controlled path rules](/k7d/concepts/security#guest-controlled-paths) are the floor for both backends. The guest agent is the same binary. Sibling forks of one tree still share the daemon. |
+| **Unchanged** | The daemon is still the one host component both backends share (control socket, TAP/bridge, vsock proxy, tree bookkeeping). [Privilege separation](/k7d/concepts/security#privilege-separation) splits *which of its processes* holds root, not which host owns the work. The shim still rewrites the OCI spec, and the [guest-controlled path rules](/k7d/concepts/security#guest-controlled-paths) are the floor for both backends. The guest agent is the same binary. Sibling forks of one tree still share the daemon. |
 | **Lost** | Time warp, dilation, autowarp. virtiofs / hostPath (`backend firecracker has no virtiofs`). Native `MAP_PRIVATE` fork latency. |
 
 Multi-tenant `--docker` should use `k7-fc`: the guest side is identical, so it is a RuntimeClass switch, not a rewrite. The VMM jail is the extra boundary; the in-guest `docker.sock` is still guest root. See [Security](/k7d/concepts/security#firecracker-profile-k7-fc).
@@ -105,7 +161,7 @@ Multi-tenant `--docker` should use `k7-fc`: the guest side is identical, so it i
 - `utils/install-firecracker.sh` puts the pinned `firecracker` and `jailer` in `/usr/local/bin`, verifying every sha256 from `guest/fc/pins.env`. A digest mismatch is fatal. `k7d doctor` reports the version and sha it finds.
 - Daemon knobs: `K7D_FC_CHROOT_BASE` (jail root; default `/var/lib/k7d/fc`, a link onto the reflink XFS that holds the writable disks so they can be hard-linked into a jail), `K7D_FC_UID_BASE` (first uid of the per-VM lease range; default 60000, 1024 live VMs per daemon, exhaustion is an error rather than a wrap-around), `K7D_FC_FORK_SNAPSHOT` (`diff` default, `full`), `K7D_POOL_BACKEND` (`native` | `firecracker` for the warm pool).
 
-Known issue: K7 observed CRI `exec` into a `k7-fc` pod hanging after a `k7 pause` / `k7 resume` cycle (readiness probe timeout, K7 [PERFORMANCE.md](https://github.com/Katakate/k7/blob/main/PERFORMANCE.md)). Native `k7` is unaffected.
+k7 **0.4.0** and k7d **0.7.0** both pin Firecracker **v1.16.2**. k7 **0.3.1** still vendored **v1.16.1**, which gated vsock RX after a bare `PATCH /vm Resumed` (upstream [#6100](https://github.com/firecracker-microvm/firecracker/issues/6100)). Current k7d **fails `k7 resume` loudly** on that old pin (`guest unreachable over vsock after Resumed (Firecracker < v1.16.2)`). Native `k7d` is unaffected. Stay on k7 0.4.0 + k7d 0.7.0 for resume→exec on `k7d-fc`.
 
 ## Reference
 

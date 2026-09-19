@@ -66,7 +66,7 @@ flowchart LR
 | Backend | Where `dockerd` runs | Graph disk | Pause / resume | `k7 fork` | `k7 restore` |
 |---|---|---|---|---|---|
 | `k7d` | **Guest agent service** — no extra CRI container, the sandbox container is not privileged. Pod is stamped `k7d.katakate.org/docker=true` | Per-sandbox virtio-blk scratch image (`k7d.katakate.org/docker-disk`), deleted with the VM | ✅ VM frozen in place; graph intact | ✅ **Warm CoW fork of the live engine** — the child keeps `dockerd`, its images, and running inner containers (graph disk is reflinked) | ❌ (k7d has no named snapshots) |
-| `k7d-fc` | Same guest service, VM under the Firecracker jailer | Same | ✅ (see the [k7d-fc note](/k7/concepts/backends#k7d-fc) about exec after resume) | ✅ Same, child stays overlay2 | ❌ |
+| `k7d-fc` | Same guest service, VM under the Firecracker jailer | Same | ✅ graph intact; resume→exec needs Firecracker **v1.16.2+** (see [k7d-fc](/k7/concepts/backends#k7d-fc)) | ✅ Same, child stays overlay2 | ❌ |
 | `kql` | Privileged **`docker-vehicle`** container in the same Kata VM; the sandbox container's security context is unchanged | Second Longhorn **Block** PVC `<name>-docker-lh` (ext4, overlay2) | ✅ Graph persists on the PVC; `--snapshot` snapshots both volumes | ✅ Disk clone of root **and** graph PVC, then cold boot | ✅ Both PVCs restored |
 | `kfd` | Privileged `docker-vehicle` in the same Kata VM | Generic ephemeral volume from StorageClass `k7-docker-lvm` (OpenEBS LVM LocalPV over `kata-vg/thin-pool`), deleted with the pod | Scale to 0 / 1 — graph lost | ❌ Rejected (`k7 fork of a kfd --docker sandbox is not supported`) | ❌ |
 

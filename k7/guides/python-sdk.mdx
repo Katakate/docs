@@ -11,11 +11,15 @@ The **`k7-sdk`** PyPI package (`import k7_sdk`) wraps the K7 HTTP API in two cli
 ## Install
 
 ```bash
-pip install k7-sdk            # sync client (requests only)
-pip install "k7-sdk[async]"   # also installs httpx for AsyncClient
+pip install k7-sdk==0.4.0            # sync client (requests only)
+pip install "k7-sdk[async]==0.4.0"   # also installs httpx for AsyncClient
 ```
 
+Run this on your **laptop / client**. A k7 node (fresh Ubuntu 24.04) does not ship `python3-venv`; `python3 -m venv …` fails until `sudo apt install -y python3-venv python3-pip`.
+
 The async client raises `RuntimeError` at construction time if `httpx` isn't installed.
+
+Always pass `verify_ssl` as the cluster CA path on the default HTTPS install (`./k7-ca.crt`, or `/etc/k7/tls/ca.crt` on the node). k7 **0.4.0** `k7 api status` prints a snippet that includes it; 0.3.1 omitted it and that snippet failed against the playbook-minted CA.
 
 ## Quickstart
 
@@ -118,7 +122,7 @@ See [Sandboxes API](/k7/api/endpoints/sandboxes#request-body-schema) for the ful
 
 ## Wait until ready
 
-The API returns immediately after creating Kubernetes objects; the pod schedules and boots in the background. A small polling helper:
+HTTP `POST /sandboxes` (and `Client.create` / `k7 create`) returns once Kubernetes objects exist — often while `ready` is still `False`. Poll `list()` before exec or curling a NodePort:
 
 ```python
 import time
@@ -127,7 +131,8 @@ def wait_until_ready(client, name, namespace="default", timeout=120):
     deadline = time.time() + timeout
     while time.time() < deadline:
         for s in client.list(namespace=namespace):
-            if s["name"] == name and s["status"] == "Running" and s["ready"] == "True":
+            ready = s.get("ready")
+            if s["name"] == name and s.get("status") == "Running" and ready in (True, "True"):
                 return
         time.sleep(2)
     raise TimeoutError(f"{name} did not become Ready")
@@ -179,6 +184,7 @@ base.pause(snapshot="demo-v1")
 base.delete()
 
 restored = k7.restore("demo-v1", "demo-restored")
+wait_until_ready(k7, "demo-restored")  # restore returns once objects exist; boot is async
 print(restored.exec("ls /")["stdout"])
 ```
 

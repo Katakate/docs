@@ -15,7 +15,7 @@ The release [installer](/k7d/getting-started/installation) does all four steps f
 The shim is a thin client: sandbox `Create` calls the daemon over `/run/k7d/k7d.sock` and fails loudly if it is not running.
 
 ```bash
-cd dist/k7d-v0.6.0-x86_64-linux     # or the extracted release tarball
+cd dist/k7d-v0.7.0-x86_64-linux     # or the extracted release tarball
 cp k7d /usr/local/bin/
 mkdir -p /usr/local/share/k7d /opt/k7d
 cp vmlinux initramfs.cpio.gz /usr/local/share/k7d/

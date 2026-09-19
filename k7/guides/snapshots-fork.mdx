@@ -33,13 +33,11 @@ State written to `/mnt/state` (and to the rootfs via the bind-mount overlay) sur
 
 ```bash
 k7 pause demo                           # scale to 0, no snapshot
-k7 pause demo --snapshot demo-snap-1    # take a VolumeSnapshot, then scale to 0
+k7 pause demo --snapshot                # auto-named <sandbox>-paused-<unix-ts>
+k7 pause demo --snapshot=demo-snap-1  # take a VolumeSnapshot, then scale to 0
 ```
 
-Optional flags:
-
-- `--pvc PVC_NAME` — explicit PVC to snapshot. Defaults to `<sandbox>-root-lh`.
-- `--snapshot-class CLASS` — `VolumeSnapshotClass`. Defaults to `longhorn` (created by the playbook).
+`--snapshot` is the only pause flag besides `-n`. Bare `--snapshot` auto-names; `--snapshot=NAME` uses your name. There is no `--pvc` or `--snapshot-class` on the CLI (those were removed). Restore is `k7 restore SNAPSHOT_NAME NEW_SANDBOX_NAME` — there is no `--latest`.
 
 The snapshot is **crash-consistent**: it captures the disk state at the moment of the snapshot, not the in-memory process state. The sandbox process is then terminated as the Deployment scales to 0.
 
@@ -54,6 +52,10 @@ k7 resume demo
 ```
 
 Scales the Deployment back to 1. The pod re-attaches to the same PVC; data on `/mnt/state` is exactly as it was at pause time. If the pause took a snapshot, the snapshot remains available — useful for rollback if the resumed workload corrupts something.
+
+**Wait until Ready before `k7 exec`.** On a 3-node HA cluster Longhorn attach can leave the pod `Pending` for tens of seconds after `k7 resume` returns. Poll `k7 list` until `Ready` is `True` (the same wait you need after `Client.resume()` / `k7 restore`).
+
+`k7 snapshot list` may show `READY False` for a few seconds after `k7 snapshot create`; wait for `readyToUse: true` before `k7 restore`.
 
 ## Fork
 
@@ -77,7 +79,7 @@ Fork takes a snapshot of the source sandbox's PVC, **clones it into a new PVC**,
 - CPU registers / process state
 - Network identity (the fork gets a new pod IP)
 
-**What a fork inherits on every backend:** the source's egress whitelist *and* its `ingress_ports` / `ingress_from` policy, so a child is never more reachable than its parent (an earlier release left forks fully ingress-closed). It does **not** inherit an `expose_ports` NodePort Service — expose the child explicitly if you need it. A `--docker` source forks with its graph disk (`kql`: cloned PVC; `k7d` / `k7d-fc`: reflinked scratch disk, dockerd keeps running with `overlay2`); `kfd` rejects fork.
+**What a fork inherits on every backend:** the source's egress whitelist *and* its `ingress_ports` / `ingress_from` policy, so a child is never more reachable than its parent (an earlier release left forks fully ingress-closed). It does **not** inherit an `expose_ports` NodePort Service — expose the child explicitly if you need it. A `--docker` source forks with its graph disk (`kql`: cloned PVC; `k7d` / `k7d-fc`: reflinked scratch disk, dockerd keeps running with `overlay2`); `kfd` rejects fork. k7 **0.4.0** prints a direct "kfd cannot fork" error. On **0.3.1** that rejection was a PVC 404 (`Source root PVC <name>-root-lh not found; cannot fork storage`) — kfd has no Longhorn PVC.
 
 ## Observed performance
 

@@ -136,13 +136,13 @@ ansible_ssh_private_key_file=~/.ssh/id_ed25519
 longhorn_replicas=2
 ```
 
-For a 3-node HA cluster with **all backends on every node** (`kfd`, `kql`, `k7d`, `k7d-fc`), one command from the first master brings everything up. Clone [Katakate/k7](https://github.com/Katakate/k7) at `v0.3.1` on that master and run `k7 install` from the checkout (`k7-api:local` is built from cwd). Fresh nodes have no SSH host keys yet — either `ssh-keyscan` the peers into `known_hosts` or set `ansible_ssh_common_args` as below:
+For a 3-node HA cluster with **all backends on every node** (`kfd`, `kql`, `k7d`, `k7d-fc`), one command from the first master brings everything up. Clone [Katakate/k7](https://github.com/Katakate/k7) at `v0.4.0` on that master and run `k7 install` from the checkout (`k7-api:local` is built from cwd). Fresh nodes have no SSH host keys yet — either `ssh-keyscan` the peers into `known_hosts` or set `ansible_ssh_common_args` as below:
 
 ```ini
 [k7_servers]
-k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
-k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
-k7-node-03 ansible_host=203.0.113.12 k7_backends=kfd,kql,k7d
+k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d,k7d-fc
+k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d,k7d-fc
+k7-node-03 ansible_host=203.0.113.12 k7_backends=kfd,kql,k7d,k7d-fc
 
 [k7_cluster:children]
 k7_servers
@@ -155,17 +155,19 @@ longhorn_replicas=3
 ```
 
 ```bash
-k7 install -i inventory.ini --ha --k7d-version 0.6.0
+k7 install -i inventory.ini --ha --k7d-artifact /root/k7d-v0.7.0-x86_64-linux.tar.gz
 ```
+
+`--k7d-version 0.7.0` downloads the public GitHub release instead (also the playbook default). A tarball you built from k7d source is `--k7d-artifact`. k7 **0.4.0** copies Firecracker **v1.16.2** for `k7d-fc`.
 
 Two-node (one server + one agent, **no `--ha`** — embedded etcd needs 3+ servers). After each box has Ubuntu on one NVMe and a raw spare (`TWO_DISK`):
 
 ```ini
 [k7_servers]
-k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d
+k7-node-01 ansible_host=203.0.113.10 k7_backends=kfd,kql,k7d,k7d-fc
 
 [k7_agents]
-k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d
+k7-node-02 ansible_host=203.0.113.11 k7_backends=kfd,kql,k7d,k7d-fc
 
 [k7_cluster:children]
 k7_servers
@@ -179,7 +181,7 @@ longhorn_replicas=2
 ```
 
 ```bash
-k7 install -i inventory.ini --k7d-version 0.6.0
+k7 install -i inventory.ini --k7d-version 0.7.0
 ```
 
 Don't pass `--backend` alongside `-i`: the per-host `k7_backends` in the inventory is authoritative (an explicit `--backend` overrides it).

@@ -9,7 +9,7 @@ The k7d daemon exposes its control plane on a Unix socket, by default **`/run/k7
 
 ```bash
 echo '{"op":"ping"}' | socat - UNIX-CONNECT:/run/k7d/k7d.sock
-# {"status":"pong","version":"0.6.0"}
+# {"status":"pong","version":"0.7.0"}
 ```
 
 <Note>

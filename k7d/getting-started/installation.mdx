@@ -17,7 +17,7 @@ description: "Five-minute quickstart, install from a release tarball or build fr
 - Optional: **k3s**, if you want pods scheduled as k7d microVMs via
   [`runtimeClassName: k7`](/k7d/guides/runtime-class).
 - Optional: the pinned **Firecracker + jailer** (`utils/install-firecracker.sh`,
-  v1.16.1, sha-verified) if you want the [`k7-fc` backend](/k7d/concepts/backends).
+  v1.16.2, sha-verified) if you want the [`k7-fc` backend](/k7d/concepts/backends).
 
 `k7d doctor` runs exactly these checks without starting a daemon:
 
@@ -65,8 +65,8 @@ containerd shim, the guest kernel, the guest initramfs, the guest
 docker payload, and an installer.
 
 ```bash
-tar xzf k7d-v0.6.0-x86_64-linux.tar.gz
-cd k7d-v0.6.0-x86_64-linux
+tar xzf k7d-v0.7.0-x86_64-linux.tar.gz
+cd k7d-v0.7.0-x86_64-linux
 sudo ./install.sh
 ```
 
@@ -120,8 +120,9 @@ sudo bash utils/install-firecracker.sh   # reads guest/fc/pins.env, verifies eve
 ```
 
 <Note>
-k7d **0.6.0** ships the Firecracker engine, the in-guest Docker service,
-and the shim hardening rules. Use that tarball (or newer), not 0.5.0.
+k7d **0.7.0** is the current tarball (privilege separation, Intel warm-fork
+CET/XSS, Firecracker jail integrity). The Firecracker engine and in-guest
+Docker service first shipped in 0.6.0 — do not use 0.5.0.
 </Note>
 
 ## Build from source
@@ -140,7 +141,7 @@ make release    # daemon, shim, guest kernel, rootfs → dist/
 there, or start the daemon directly for a quick look:
 
 ```bash
-cd dist/k7d-v0.6.0-x86_64-linux
+cd dist/k7d-v0.7.0-x86_64-linux
 sudo K7D_KERNEL=$PWD/vmlinux K7D_INITRD=$PWD/initramfs.cpio.gz RUST_LOG=info ./k7d &
 ```
 

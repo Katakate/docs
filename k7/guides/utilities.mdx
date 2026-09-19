@@ -75,7 +75,7 @@ watch 'k3s kubectl top pods -n stress-test --sort-by=cpu'
 Cleanup when done (also done automatically on Ctrl+C):
 
 ```bash
-k7 delete-all -n stress-test -y
+k7 delete-all -n stress-test
 rm k7-stress-*.yaml
 k3s kubectl delete namespace stress-test
 ```

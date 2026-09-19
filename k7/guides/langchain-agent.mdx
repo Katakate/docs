@@ -3,12 +3,12 @@ title: "LangChain agent tutorial"
 description: "Build a ReAct agent that executes inside a K7 sandbox"
 ---
 
-This tutorial walks you through wiring a LangChain ReAct agent with a tool that executes shell commands in a K7 sandbox.
+This tutorial walks you through wiring a LangChain agent with a tool that executes shell commands in a K7 sandbox.
 
 ## Prerequisites
 
-- K7 API running (`k7 install` deploys it by default; check with `k7 api status`) and reachable
-- API key generated: `k7 generate-api-key <name>`
+- K7 API running (`k7 install` deploys it by default; from a laptop check `GET /health` or `k7 api status` after `k7 config set`) and reachable
+- API key generated: `k7 generate-api-key <name>` (on a cluster node)
 - Python 3.10+
 
 ## Setup
@@ -26,22 +26,20 @@ OPENAI_API_KEY=sk-your-openai-key
 OPENAI_MODEL=gpt-4o-mini
 ```
 
-Install dependencies:
+Install dependencies (LangChain 1.x — `initialize_agent` was removed):
 
 ```bash
-pip install langchain langchain-openai python-dotenv k7-sdk
+pip install "langchain>=1.0" langchain-openai python-dotenv k7-sdk==0.4.0
 ```
 
 ## Agent code
 
 ```python
 import os, time
-from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
-from langchain.agents import initialize_agent, AgentType
-from langchain.memory import ConversationBufferMemory
-from langchain.tools import Tool
+from langchain.agents import create_agent
+from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from k7_sdk import Client, SandboxProxy
 
@@ -52,18 +50,19 @@ K7_API_KEY = os.getenv("K7_API_KEY")
 SANDBOX_NAME = os.getenv("K7_SANDBOX_NAME", "lc-agent")
 SANDBOX_IMAGE = os.getenv("K7_SANDBOX_IMAGE", "alpine:latest")
 SANDBOX_NAMESPACE = os.getenv("K7_NAMESPACE", "default")
-
-K7_API_CA = os.getenv("K7_API_CA", "./k7-ca.crt")  # cluster CA from /etc/k7/tls/ca.crt on the node
+K7_API_CA = os.getenv("K7_API_CA", "./k7-ca.crt")
 
 k7 = Client(endpoint=K7_ENDPOINT, api_key=K7_API_KEY, verify_ssl=K7_API_CA)
 _sb: Optional[SandboxProxy] = None
 
-def ensure_sandbox_ready(timeout_seconds: int = 60) -> SandboxProxy:
+def ensure_sandbox_ready(timeout_seconds: int = 120) -> SandboxProxy:
     try:
         sb = k7.create({
             "name": SANDBOX_NAME,
             "image": SANDBOX_IMAGE,
             "namespace": SANDBOX_NAMESPACE,
+            "backend": "k7d",
+            "limits": {"cpu": "1", "memory": "1Gi"},
         })
     except Exception:
         sb = SandboxProxy(SANDBOX_NAME, SANDBOX_NAMESPACE, k7)
@@ -71,39 +70,29 @@ def ensure_sandbox_ready(timeout_seconds: int = 60) -> SandboxProxy:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         for info in k7.list(namespace=SANDBOX_NAMESPACE):
-            if info.get("name") == SANDBOX_NAME and info.get("status") == "Running":
+            if info.get("name") == SANDBOX_NAME and info.get("ready") == "True":
                 return sb
         time.sleep(2)
     raise RuntimeError("Sandbox did not become Running in time")
 
-def run_code_in_sandbox(code: str) -> str:
+@tool
+def sandbox_exec(command: str) -> str:
+    """Execute a shell command inside an isolated K7 sandbox."""
     global _sb
     if _sb is None:
         _sb = ensure_sandbox_ready()
-    result = _sb.exec(code)
+    result = _sb.exec(command)
     if result.get("exit_code", 1) != 0:
         return f"[stderr]\n{result.get('stderr','')}\n[stdout]\n{result.get('stdout','')}"
     return result.get("stdout", "")
 
-tool = Tool(
-    name="sandbox_exec",
-    description="Execute a shell command inside an isolated K7 sandbox. Input should be a shell command string.",
-    func=run_code_in_sandbox,
+agent = create_agent(
+    model=ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0),
+    tools=[sandbox_exec],
+    system_prompt="You run shell commands in an isolated K7 sandbox via the sandbox_exec tool.",
 )
 
-llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0)
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-
-agent = initialize_agent(
-    tools=[tool],
-    llm=llm,
-    agent=AgentType.CONVERSATIONAL_REACT_DESCRIPTION,
-    memory=memory,
-    verbose=True,
-    handle_parsing_errors=True,
-)
-
-print("Ask me to run a command in a sandbox, e.g.: 'List files in /'\n")
+print("Ask me to run a command in a sandbox, e.g.: 'List files in /'\\n")
 while True:
     try:
         user = input("You: ")
@@ -111,12 +100,10 @@ while True:
         break
     if not user.strip():
         continue
-    resp = agent.invoke({"input": user})
-    print("Agent:", resp.get("output", str(resp)))
+    resp = agent.invoke({"messages": [{"role": "user", "content": user}]})
+    print("Agent:", resp["messages"][-1].content)
 ```
 
 <Tip>
-You can shell into the same sandbox in parallel: `k7 shell lc-agent`.
+You can exec into the same sandbox in parallel: `k7 exec lc-agent -- ls /`. `k7 shell` is node-local.
 </Tip>
-
-
