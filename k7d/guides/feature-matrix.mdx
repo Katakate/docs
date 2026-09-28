@@ -9,7 +9,7 @@ Two layers — most RL users only care about the first.
 
 This is the k3s that lives *inside* the VMs you fork ([cluster mode](/k7d/guides/cluster-mode)). The fork engine is **N-node** (`tree_create_cluster(vm_count)` / adopt any live set) — there is no hard-coded 3.
 
-Two guests prove the rows below. The **minimal CI guest** fixture is a 3-node control plane with flannel + kube-proxy and a real in-cluster Deployment; its default profile keeps stock k3s add-ons off so the lean path stays lean, and each add-on is an opt-in profile with its own proving test. The **[Ubuntu node](/k7d/guides/ubuntu-nodes)** runs stock Ubuntu 24.04 with k3s' own containerd and takes Cilium, Tetragon, Longhorn, and the ML operators. Every ✅ is an integration test that brings the feature up, warm-forks the cluster, and checks source and fork keep working, then diverge independently.
+Two guests prove the rows below. The **minimal CI guest** fixture is a 3-node control plane with flannel + kube-proxy and a real in-cluster Deployment; its default profile keeps stock k3s add-ons off so the lean path stays lean, and each add-on is an opt-in profile with its own proving test. The **[Ubuntu node](/k7d/guides/ubuntu-nodes)** runs stock Ubuntu 24.04 with k3s' own containerd and takes Cilium, Tetragon, Longhorn, and the ML operators. Every ✅ is an integration test that brings the feature up, warm-forks the cluster, and checks source and fork keep working, then diverge independently. The exceptions are rows marked "not fork-tested": their tests prove the feature on a live cluster without forking it.
 
 | Feature | Status | Proven on | Notes |
 |---|---|---|---|
@@ -36,7 +36,12 @@ Two guests prove the rows below. The **minimal CI guest** fixture is a 3-node co
 | JobSet v0.12.0 on mock GPUs | ✅ Today | Ubuntu | 2-worker JobSet rendezvous over cluster DNS and Completes; in-flight + Complete survive a fork. **Not CUDA / not DeepSpeed** |
 | Kubeflow Trainer v2.2.1 (TrainJob) on mock GPUs | ✅ Today | Ubuntu | 2-worker TrainJob stays Running across a fork; a child-only TrainJob stays invisible on the source. **Not a PyTorch runtime** |
 | Kueue v0.19.2 on mock GPUs | ✅ Today | Ubuntu | A ClusterQueue with GPU quota 1 admits one Job and holds the second Pending; the split survives a fork. **Not a batch-scheduler claim** |
+| Configurable fake GPU count (0.8.0) | ✅ Today | Ubuntu | `FAKE_GPU_COUNT` (default 2). At 8 per node an 8-GPU pod fits and a second stays Pending on fragmented nodes. Not fork-tested. **Mock only** |
+| Fake GPU `Allocate` device IDs (0.8.0) | ✅ Today | Ubuntu | `NVIDIA_VISIBLE_DEVICES` carries the kubelet-assigned `fake-gpu-N` IDs, matching the pod-resources API. Not fork-tested. **Not `/dev/nvidia*`** |
+| Per-pod fake DCGM (0.8.0) | ✅ Today | Ubuntu | One `DCGM_FI_DEV_*` series per fake GPU, labelled with the owning pod; labels drop on pod delete; the scrape survives a fork. **Not NVML** |
+| Fake GPU flavors + topology, Kueue TAS (0.8.0) | ✅ Today | Ubuntu | Product and block/rack labels; Kueue flavors `fake-h100` / `fake-l40s` route Jobs; a required-block TAS Job lands in one block. Not fork-tested. **Mock only** |
 | KubeRay v1.7.0 on mock GPUs | ✅ Today | Ubuntu | CPU head + GPU worker schedule on the mock and survive a fork. **Not CUDA** |
+| RayJob, CPU Ray 2.47.1 on mock GPUs (0.8.0) | ✅ Today | Ubuntu | A RayJob with a 1-GPU worker reaches `SUCCEEDED`; Ray reports `0.0/1.0 GPU` from KubeRay's injected `--num-gpus`. Not fork-tested. **Not Ray GPU hardware placement** |
 | Soft-RoCE (`rdma_rxe`) | ✅ Today | Ubuntu | `rxe0` on guest `eth0`; `rdma link` + `ibv_devinfo` on ≥2 nodes survive a fork; a child-only `rxe1` stays invisible on the source. **Not NCCL / not GPUDirect** |
 | Nested `hostNetwork` pods | ❌ Not today | — | Known failure mode in the guest |
 

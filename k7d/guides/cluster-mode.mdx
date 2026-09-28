@@ -25,13 +25,17 @@ Practical sizing: the minimal CI guest costs ~3.2 GiB of host RAM per k3s node, 
 
 Takes VMs the daemon already owns and converts them into a cluster tree root. This is the path when members need *different* configs — an Ubuntu k3s server and its agents with their own command lines and root disks, or pods deployed via [RuntimeClass k7](/k7d/guides/runtime-class) with a shared `cluster-id` annotation. The VMs must already share one cluster bridge — same `cluster_id`, distinct `vm_index`es covering `0..N-1`.
 
-Adoption fails loud on any half-wired state (missing VM, mixed bridges, non-contiguous indices, already tree-owned). Validation failures put the VMs back untouched; a failure after extraction tears everything down — no half-adopted state survives. Adoption also writes the root's keyframe: a full memory dump, and the only full dump the tree ever needs.
+Adoption fails loud on any half-wired state (missing VM, mixed bridges, non-contiguous indices, already tree-owned). Validation failures put the VMs back untouched; a failure after extraction tears everything down — no half-adopted state survives. Adoption also writes the root's keyframe: a full memory copy, and the only full copy the tree ever needs. In 0.8.0 it is one [coordinated cut](/k7d/concepts/snapshot-tree#how-a-cluster-keyframe-is-cut), pre-copied while the members run, and `tree_created.pause_ns` reports what each member lost (tens of milliseconds, even for a 30 GiB member).
+
+After adoption the tree owns the VMs. `stop_vm` on their old ids errors in 0.8.0 (`was adopted into tree …; use tree_prune / tree_drop`), and they disappear from `list_vms`. Tear down with `tree_drop` or by pruning the root, then delete any `block_devices` images you supplied yourself. Details: [Who owns an adopted VM](/k7d/concepts/snapshot-tree#who-owns-an-adopted-vm).
 
 <Note>
 Setting up a k3s cluster *inside* the VMs is your scenario's job (boot k3s server + agents, wait for Ready). k7d gives you the fork. The [Ubuntu nodes](/k7d/guides/ubuntu-nodes) guide shows the whole recipe with the command-line boot contract; the integration tests and `examples/cluster-tree-search` show the busybox fixture end to end.
 </Note>
 
 ### Egress posture
+
+Both create ops also take `ksm: true` (0.8.0) to let `ksmd` merge identical guest pages across the tree's members and forks. It is for same-tenant hosts only; see [Snapshot tree — KSM](/k7d/concepts/snapshot-tree#sharing-identical-pages-ksm).
 
 Both create ops take an optional `egress` policy — `open` (default), `deny`, or `whitelist` with CIDR:port pairs — enforced by the per-tree nftables jail. Forks inherit their source's policy. Full shape: [`EgressPolicy`](/k7d/api/protocol#egresspolicy); what the jail contains: [Security model](/k7d/concepts/security#the-tree-jailer).
 
@@ -46,7 +50,7 @@ Once rooted, a cluster tree uses the same verbs as a single-VM tree — every op
 {"op": "tree_resume", "tree_id": "t1", "node_id": "branch-a"}
 ```
 
-Responses carry one `guest_cids` entry per member (ordered by `vm_index`), so your harness can dial each member's agent, and `latency_ns` — the daemon's own wall time for the fork, which is what the budgets are asserted on. Batch cluster forks run sequential warm forks — each branch gets its own bridge.
+Responses carry one `guest_cids` entry per member (ordered by `vm_index`), so your harness can dial each member's agent. Keep them: exec is vsock straight to a CID, and `tree_nodes.live_guest_cids` is the only other place to find them. They also carry `latency_ns` — the daemon's own wall time for the fork, which is what the budgets are asserted on. Batch cluster forks run sequential warm forks — each branch gets its own bridge.
 
 On the Firecracker engine (`backend: firecracker`) the same verbs apply: members are paused in parallel (skew p99 ≈ 125 µs), each takes a Diff snapshot onto a reflinked base, and every child is a fresh jailed Firecracker restored from its own reflink — ~0.67 s for a 3-member busybox cluster in a debug build, versus ~105 ms native. Suspend exports the point out of the jail; resume re-stages a jail and restores with the member's network identity. See [Backends](/k7d/concepts/backends).
 
@@ -54,11 +58,11 @@ The `fork_memory_full_copy` flags in fork responses tell you whether each member
 
 ### Forking from a child
 
-Any live node is a fork source, so trees go as deep as the search does. The first fork *from* a child writes that child's keyframe — a reflink clone of the nearest ancestor's memory image plus only the pages the child dirtied, so a mid-tree fork point costs O(divergence), not O(guest RAM): ~0.8 s for an idle 3 × 2 GiB Ubuntu cluster versus ~7.8 s for the root's full dump. `tree_prepare_fork_source` writes it explicitly if you want to show the checkpoint as its own step. See [Snapshot tree — keyframes](/k7d/concepts/snapshot-tree#keyframes).
+Any live node is a fork source, so trees go as deep as the search does. The first fork *from* a child writes that child's keyframe — a reflink clone of the nearest ancestor's memory image plus only the pages the child dirtied, so a mid-tree fork point costs O(divergence), not O(guest RAM): ~0.8 s for an idle 3 × 2 GiB Ubuntu cluster versus ~7.8 s for the root's full dump on 0.7.0. `tree_prepare_fork_source` writes it explicitly if you want to show the checkpoint as its own step. In 0.8.0, `refresh: true` re-keyframes a long-lived root into a new generation, so later forks stop re-copying its accumulated dirty set. Children already mapping the old generation are unaffected. See [Snapshot tree — keyframes](/k7d/concepts/snapshot-tree#keyframes).
 
 ### Forking at a different clock
 
-`tree_fork` / `tree_fork_batch` accept `dilation`: the children run at that factor while the source keeps its own. One ×1 source tree can serve ×8 exploration branches and ×1 control branches at once. See [Time warp](/k7d/guides/time-warp).
+`tree_fork` / `tree_fork_batch` accept `dilation`: the children run at that factor while the source keeps its own. One ×1 source tree can serve ×8 exploration branches and ×1 control branches at once. In 0.8.0 they also accept `dilation_policy` (`fixed` / `down` / `track`), so the daemon lowers a branch's factor when its vCPUs saturate. See [Time warp](/k7d/guides/time-warp#adaptive-dilation-per-tree-policy-loop).
 
 ## What the numbers look like
 
@@ -69,6 +73,7 @@ Any live node is a fork source, so trees go as deep as the search does. The firs
 | On-host 3-VM cluster warm fork (busybox) | ~25–40 ms quiet | 150 ms |
 | 50× 3-VM cluster-tree forks (shared pause) | ~3.85 s (~77 ms/cluster) | 20 s |
 | Cluster-tree suspend / resume (3 VMs) | ~25 ms / ~40 ms | 750 ms each |
+| Root keyframe pause, 30 GiB + 512 MiB members (main, pre-copy) | **44 ms** max per member (48.9 s as a paused full dump) | measured, not budgeted |
 | Lockstep clock warp (3 VMs) | ~0.4 ms for the ioctls | 250 ms |
 
 Methodology and reproduction commands: [Benchmarks](/k7d/deep-dives/benchmarks). What works inside a forked cluster today (CoreDNS, Ingress, Cilium, Longhorn, …): [Feature matrix](/k7d/guides/feature-matrix).

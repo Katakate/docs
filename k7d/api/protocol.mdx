@@ -9,11 +9,15 @@ The k7d daemon exposes its control plane on a Unix socket, by default **`/run/k7
 
 ```bash
 echo '{"op":"ping"}' | socat - UNIX-CONNECT:/run/k7d/k7d.sock
-# {"status":"pong","version":"0.7.0"}
+# {"status":"pong","version":"0.8.0"}
 ```
 
 <Note>
 Clients reach the **guest agent** themselves over vsock, using the `guest_cid` returned by `create_vm` — the daemon does not proxy the agent protocol (vsock CIDs are a kernel-global namespace, so any host process can connect to a running VM's agent).
+</Note>
+
+<Note>
+Fields and behaviour marked **(0.8.0)** shipped in 0.8.0 and were not in the 0.7.0 tarball: `dilation_policy` / `dilation_config`, `ksm`, `refresh`, `pause_ns`, the adopted-VM teardown rules, and the new `tree_nodes` / `doctor` fields.
 </Note>
 
 Reference clients: a thin Python client covering the tree verbs in [`examples/cluster-tree-search/k7d_client.py`](https://github.com/katakate/k7d/tree/main/examples/cluster-tree-search), an MCP server wrapping the tree for a frontier agent in [`examples/k7d-mcp/`](https://github.com/katakate/k7d/tree/main/examples/k7d-mcp), and a read-only SSE dashboard in [`examples/k7view/`](https://github.com/katakate/k7d/tree/main/examples/k7view).
@@ -23,7 +27,7 @@ Reference clients: a thin Python client covering the tree verbs in [`examples/cl
 | `op` | Fields | What it does |
 |---|---|---|
 | `ping` | — | Liveness check. → `pong` with the daemon `version` |
-| `doctor` | — | Host readiness: `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`, cgroup v2. Same checks as `k7d doctor`; creates no VM. → `doctor` with `kvm`, `vhost_vsock`, `tun`, `cgroup_v2`, `ok`, `fc_fork_mode` (`diff` \| `full`, from `K7D_FC_FORK_SNAPSHOT`), `details[]` |
+| `doctor` | — | Host readiness: `/dev/kvm`, `/dev/vhost-vsock`, `/dev/net/tun`, cgroup v2. Same checks as `k7d doctor`; creates no VM. → `doctor` with `kvm`, `vhost_vsock`, `tun`, `cgroup_v2`, `ok`, `fc_fork_mode` (`diff` \| `full`, from `K7D_FC_FORK_SNAPSHOT`), `ksm_run` **(0.8.0)**, `details[]`. `ksm_run` is `/sys/kernel/mm/ksm/run` read as-is (`0` stopped, `1` scanning, `2` unmerging, absent without KSM). It is advisory and does not affect `ok` |
 | `pool_status` | — | Warm-pool sizing and hit/miss counters. Always answers, even with the pool disabled (`size: 0`) |
 
 ## VM lifecycle operations
@@ -32,10 +36,10 @@ Reference clients: a thin Python client covering the tree verbs in [`examples/cl
 |---|---|---|
 | `create_vm` | `config` (VmConfig) | Create and boot a VM. → `vm_created` |
 | `vm_status` | `vm_id` | Query a VM's state. → `vm_state` with `state`, `guest_cid`, `virtiofs_shares`, `block_devices`, `fork_memory_full_copy`, and the `kernel` it actually booted |
-| `list_vms` | — | List all VMs the daemon owns. → `vm_list` |
-| `stop_vm` | `vm_id` | Shut down and forget a VM. Ephemeral disks go with it; named data disks stay. → `ok` |
+| `list_vms` | — | List the daemon's **sandbox registry**: `create_vm` and `fork_vm` VMs. Tree members (adopted, `tree_create*`, `tree_fork*`) are not listed; find those with `tree_list` / `tree_nodes`. → `vm_list` |
+| `stop_vm` | `vm_id` | Shut down and forget a VM. Ephemeral disks go with it; named data disks stay. → `ok`. **(0.8.0)** On an id that `tree_adopt_cluster` took, it errors with `VM … was adopted into tree …; use tree_prune / tree_drop` and frees nothing. Unknown ids still return `no such VM` |
 | `pause_vm` / `resume_vm` | `vm_id` | Stop / restart the vCPU threads and park device workers; guest memory, devices, and the vsock CID are retained. Idempotent. → `ok` |
-| `dump_serial` | `vm_id` or `guest_cid` | Read a VM's accumulated serial console output (guest kernel messages, agent stderr). The `guest_cid` form also finds live VMs inside snapshot trees. → `serial_dump` |
+| `dump_serial` | `vm_id` or `guest_cid` | Read a VM's accumulated serial console output (guest kernel messages, agent stderr). The `guest_cid` form also finds live VMs inside snapshot trees; `vm_id: "{tree_id}/{node_id}"` works too. A fork's console buffer starts empty, so dump the source *before* forking if you need its pre-fork output. → `serial_dump` |
 | `fork_vm` | `vm_id`, `sandbox_id?`, `dilation?` | Warm-fork a daemon-owned VM into a new daemon-owned VM. The first fork of a VM prepares it as a fork source on the **same vsock CID** (echoed as `source_guest_cid`). `sandbox_id` registers the fork like a `create_vm`-born sandbox VM. → `vm_forked` with `vm_id`, `guest_cid`, `source_guest_cid`, `dilation` |
 | `delete_data_disk` | `id` | Delete a named persistent data disk's image — the only way its data goes away. Loud error if the image is missing or a live VM still has it attached |
 | `update_drive` | `vm_id`, `device_index`, `host_path` | Firecracker only: re-point block device `i` (`/dev/vd{a+i}`) at a new host file via `PATCH /drives` — how image slots are filled after boot. Sending it to a native VM is an error, not a no-op |
@@ -75,22 +79,22 @@ Snapshot-tree semantics (budgets, LRU eviction, protect/prune, keyframes) are ex
 
 | `op` | Fields | What it does |
 |---|---|---|
-| `tree_create` | `config`, `budget?`, `tree_id?` | Root a single-VM tree at a freshly booted VM (`config.network` must be omitted). → `tree_created` |
-| `tree_create_cluster` | `vm_count`, `config`, `budget?`, `tree_id?`, `egress?` | Root a cluster tree: `vm_count` members on a tree-owned bridge. `egress` is the tree's [egress policy](#egresspolicy); forks inherit it. → `tree_created` |
-| `tree_adopt_cluster` | `vm_ids`, `budget?`, `tree_id?`, `egress?` | Adopt live daemon-owned VMs sharing one cluster bridge as a cluster-tree root. Fails loud on any half-wired state. → `tree_created` |
-| `tree_fork` | `tree_id`, `source_id`, `label`, `dilation?` | Fork a new branch from a live or suspended node. `dilation` omitted inherits the source's factor; `0` is a loud error. → `tree_forked` |
-| `tree_fork_batch` | `tree_id`, `source_id`, `labels`, `dilation?` | Fork N branches in one call. Single-VM trees share one dirty-bitmap capture; cluster trees run sequential warm forks. Empty `labels` is a loud error. → `tree_fork_batch` |
-| `tree_prepare_fork_source` | `tree_id`, `node_id` | Write a node's keyframe now so it is a warm-fork source. `tree_fork*` calls this on demand; the explicit op lets a controller show the checkpoint as its own step. Idempotent. → `tree_prepared` |
+| `tree_create` | `config`, `budget?`, `tree_id?`, `dilation_policy?`, `dilation_config?` | Root a single-VM tree at a freshly booted VM (`config.network` must be omitted). → `tree_created` |
+| `tree_create_cluster` | `vm_count`, `config`, `budget?`, `tree_id?`, `egress?`, `dilation_policy?`, `dilation_config?`, `ksm?` | Root a cluster tree: `vm_count` members on a tree-owned bridge. `egress` is the tree's [egress policy](#egresspolicy); forks inherit it. → `tree_created` |
+| `tree_adopt_cluster` | `vm_ids`, `budget?`, `tree_id?`, `egress?`, `dilation_policy?`, `dilation_config?`, `ksm?` | Adopt live daemon-owned VMs sharing one cluster bridge as a cluster-tree root. Fails loud on any half-wired state. The ids leave the sandbox registry (see `stop_vm`). → `tree_created` |
+| `tree_fork` | `tree_id`, `source_id`, `label`, `dilation?`, `dilation_policy?`, `dilation_config?` | Fork a new branch from a live or suspended node. `dilation` omitted inherits the source's factor; `0` is a loud error. → `tree_forked` |
+| `tree_fork_batch` | `tree_id`, `source_id`, `labels`, `dilation?`, `dilation_policy?`, `dilation_config?` | Fork N branches in one call. Single-VM trees share one dirty-bitmap capture; cluster trees run sequential warm forks. Empty `labels` is a loud error. → `tree_fork_batch` |
+| `tree_prepare_fork_source` | `tree_id`, `node_id`, `refresh?` | Write a node's keyframe now so it is a warm-fork source. `tree_fork*` calls this on demand; the explicit op lets a controller show the checkpoint as its own step. Idempotent unless `refresh: true` **(0.8.0)**, which re-keyframes a node that already owns one into a new generation. See [Refreshing a keyframe](/k7d/concepts/snapshot-tree#refreshing-a-keyframe). → `tree_prepared` |
 | `tree_rollback` | `tree_id`, `node_id`, `label` | Non-destructive rollback: new branch from `node_id`'s state. → `tree_forked` |
 | `tree_protect` / `tree_unprotect` | `tree_id`, `node_id` | Mark / unmark a node as protected from auto-eviction. → `ok` |
 | `tree_suspend` | `tree_id`, `node_id` | Delta written to disk, RAM freed. → `ok` |
 | `tree_resume` | `tree_id`, `node_id` | Resume a suspended node. Members get **fresh vsock CIDs**. → `tree_resumed` |
-| `tree_prune` | `tree_id`, `node_id` | Delete a node and its whole subtree, disk included. → `ok` |
+| `tree_prune` | `tree_id`, `node_id` | Delete a node and its whole subtree, disk included. **(0.8.0)** Pruning the root of an adopted tree also releases the adopted VMs' disk pins (under `K7D_PRIVSEP=on`); a child prune does not. → `ok` |
 | `tree_auto_evict` | `tree_id` | Run budget-driven LRU eviction now. → `tree_evicted` with the evicted node ids |
-| `tree_nodes` | `tree_id` | Every node's metadata plus `usage`, `budget`, `live_guest_cids` (node id → CIDs), and `live_dilation` (node id → factor). → `tree_node_list` |
+| `tree_nodes` | `tree_id` | Every node's metadata plus `usage`, `budget`, `live_guest_cids` (node id → CIDs), `live_agent_endpoints`, and `live_dilation` (node id → factor). **(0.8.0)** Also `dilation_policy` (node id → mode), `dilation_trajectory` (node id → every factor the loop has run it at, oldest first), and `live_ksm` (node id → one `{ksm_merging_pages, ksm_stat}` per native member). → `tree_node_list` |
 | `tree_list` | — | All trees: `{tree_id, kind ("vm"/"cluster"), nodes, usage, budget}`. → `tree_list` |
 | `tree_watch` | `tree_id?` | Subscribe this connection to tree mutations. First reply is `tree_watching` (a snapshot per matched tree); then one `tree_event` line per `fork` / `protect` / `unprotect` / `suspend` / `resume` / `prune` / `evict` / `drop` until the client hangs up. The connection is event-only afterwards |
-| `tree_drop` | `tree_id` | Forget a tree: live payloads torn down, on-disk state kept |
+| `tree_drop` | `tree_id` | Forget a tree: live guests stopped, on-disk tree state kept. **(0.8.0)** Releases an adopted tree's disk pins. Caller-supplied `block_devices` images are never unlinked — deleting them is the caller's job |
 | `tree_open` | `tree_id` | Re-open an on-disk tree left by `tree_drop` or a daemon crash. Every node comes back `Suspended` (live KVM is not resurrected) — `tree_resume` to go live. Loud error if `tree.json` is missing, unparseable, or the id is already in memory. → `tree_opened` |
 
 ### `TreeBudget`
@@ -124,6 +128,36 @@ Per-tree posture for traffic leaving the tree's bridge, enforced by the [tree ne
 
 `169.254.0.0/16` (cloud metadata) is dropped in every mode unless a whitelist entry names it. RoCEv2 leaves as UDP/4791 — a whitelist that needs RDMA out of the tree must name that port.
 
+### Dilation policy fields
+
+These fields opt a tree node into the daemon's [adaptive dilation loop](/k7d/guides/time-warp#adaptive-dilation-per-tree-policy-loop).
+
+| `dilation_policy` | Behaviour |
+|---|---|
+| `fixed` (default) | No loop. The node keeps its create-time or fork-time factor |
+| `down` | Drop one rung when the cluster is saturated. Never raises |
+| `track` | Drop when saturated, raise one rung when quiet |
+
+`dilation_config` sets the loop's knobs. Omitted fields take the defaults below:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `window` | `3` | Samples a decision rests on. Must be ≥ 1 |
+| `saturated` | `0.8` | Drop at this fraction of the cluster's vCPUs awake, or more |
+| `quiet` | `0.45` | Raise at this fraction or less (`track` only). Must be below `saturated` |
+| `cadence_ms` | `1000` | Wall time between samples. Only the tree's root sets it; a fork that sets it is refused |
+| `ladder` | `[8, 4, 2, 1]` | Factors the loop moves between, strictly decreasing, each in `1..=64` |
+
+A fork that omits either field inherits the source node's mode and knobs. `down` / `track` need the native backend and a factor that sits on the ladder (`config.dilation` at create, or the child's factor at fork). Anything else is refused before a VM boots. `fixed` still validates `dilation_config`, so a child can inherit it later. The loop is not persisted, so a tree reopened with `tree_open` has no modes recorded.
+
+### KSM flag
+
+`ksm: true` on `tree_create_cluster` or `tree_adopt_cluster` marks every native member's `MAP_PRIVATE` guest RAM `MADV_MERGEABLE` once the guest is running. Forks inherit it. The default is off. Firecracker members and members with virtiofs shares, whose RAM is `MAP_SHARED`, are refused with a named error. k7d never writes `/sys/kernel/mm/ksm`: an operator has to start `ksmd`, and `doctor` reports its state in `ksm_run`. Merged pages show up per member in `tree_nodes.live_ksm`. A tree that did not opt in reports zeros.
+
+<Warning>
+**Same-tenant hosts only.** KSM merges identical pages across every mergeable mapping on the host, including another tree that also opted in. That is a cross-VM timing side channel. The flag lasts as long as the mapping does, because `MADV_UNMERGEABLE` unmerges eagerly and can OOM the host.
+</Warning>
+
 ### Fork responses
 
 `tree_created`, `tree_forked`, and `tree_resumed` responses carry `guest_cids` — one vsock CID per payload member, ordered by `vm_index` (a single entry for single-VM trees). Fork responses additionally carry:
@@ -140,7 +174,11 @@ Per-tree posture for traffic leaving the tree's bridge, enforced by the [tree ne
 ]}
 ```
 
-`tree_prepared` carries `wrote_base` (a new keyframe was written), `wrote_base_incremental` (it was a reflink clone of the nearest ancestor plus this node's dirty pages, O(divergence) instead of O(guest RAM)), `base_disk_bytes` (the physical bytes it actually added — `stat` cannot tell you this on a reflinked file), `latency_ns`, and `guest_cids`.
+`tree_created` for a native cluster tree also carries `pause_ns` **(0.8.0)**, one entry per member: the host time that member's guest did not run while the root keyframe was cut (pause, residual write, restore-swap). It also carries `max_pause_ns`. Both are measured values, not budgets, and are empty or zero for single-VM and Firecracker trees.
+
+Keep the CIDs from these replies. Guest exec is vsock straight to a CID, and the `vm_id` from `create_vm` does not reach a tree fork. To get them back later, read `tree_nodes.live_guest_cids[node_id]` (or `live_agent_endpoints` on Firecracker). `list_vms` will not show them.
+
+`tree_prepared` carries `wrote_base` (a new keyframe was written), `wrote_base_incremental` (it was a reflink clone of the nearest ancestor plus this node's dirty pages, O(divergence) instead of O(guest RAM); a `refresh` is incremental against the node's own previous keyframe), `base_disk_bytes` (the physical bytes it actually added — `stat` cannot tell you this on a reflinked file), `latency_ns`, and `guest_cids`.
 
 ## Clock operations
 

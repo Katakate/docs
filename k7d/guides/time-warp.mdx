@@ -105,6 +105,38 @@ So one ×1 source tree serves every mode: fork some children at ×8 for cheap ex
 
 Compression is exactly N through 16 — but the fidelity cost is a curve, not a cliff. Extra liveness-probe failures across N ∈ {1, 2, 4, 8, 12, 16} went 0 / 0 / 0 / 3 / 19 / 32, and in-guest churn rounds collapsed 110 → 7. The host-side reading that moved *with* the damage is busy-phase **mean awake vCPUs**: at 6 of 6 there is no idle left to sell. That is the signal an adaptive policy should watch — not probe failures, which arrive through the guest's API server, the exact thing dilation is starving.
 
+### Adaptive dilation: per-tree policy loop
+
+In 0.8.0, the daemon can watch that signal itself. Set `dilation_policy` on `tree_create`, `tree_create_cluster`, or `tree_adopt_cluster`, and a per-tree loop samples every vCPU's `KVM_GET_MP_STATE` once per cadence. It changes the factor through the same pause → set → resume path as `set_dilation`:
+
+```json
+{"op": "tree_create_cluster", "vm_count": 3,
+ "config": {"memory_mb": 2048, "vcpus": 2, "dilation": 8, "…": "…"},
+ "dilation_policy": "track"}
+```
+
+| Mode | Behaviour | Measured on one scripted 240 s guest-time episode |
+|---|---|---|
+| `fixed` (default) | No loop. The create-time factor stays | ×8: 32.0 s (8.00×); ×4: 60.9 s (4.00×) |
+| `down` | When the cluster is saturated, drop one rung down the ladder `8 → 4 → 2 → 1`. **Never raises** | 128.4 s (1.91×) |
+| `track` | Same drop, and raise one rung when the cluster is quiet again | 73.9 s (3.37×) |
+
+"Saturated" means at least 80% of the cluster's vCPUs are awake. "Quiet" means 45% or fewer. Each decision rests on 3 samples, and the gap between the two thresholds keeps the factor from oscillating. All of these can be set per tree with `dilation_config` (`window`, `saturated`, `quiet`, `cadence_ms`, `ladder`); see the [API reference](/k7d/api/protocol#dilation-policy-fields). The create-time factor has to be one of the ladder's rungs.
+
+`down` exists because a rate that follows host load makes every guest-time measurement in an episode (a probe period, a backoff, a reward) incomparable with the same measurement in another episode. Dropping is monotone, happens at most once per rung, and is reported. `track` recovers more compression when a busy phase ends, and pays for it with a clock rate that depends on load. Which trade is right is the caller's decision.
+
+Forks inherit the source node's mode and knobs unless the fork sets its own. That includes `tree_fork` / `tree_fork_batch`, which accept `dilation_policy` and `dilation_config` too, but not `cadence_ms`: a tree has one loop and one sleep, so the root owns the cadence. `tree_nodes` reports each node's `dilation_policy` and its `dilation_trajectory`, the list of factors the loop has run it at. The loop needs the native engine and the KVM patch. It is not persisted, so a tree reopened with `tree_open` comes back `fixed`.
+
+<Note>
+A `window` of 1 can spend a rung on the sample taken as the loop starts, before any fork exists, because the vCPUs are still awake from the snapshot resume that created the tree. Keep the window at 3 unless you are testing the loop itself.
+</Note>
+
+### Intel hosts: rebuild the patch
+
+The carried KVM patch is at **ABI generation 3** in 0.8.0. On Intel hosts that use the VMX preemption timer (`kvm_intel preemption_timer=Y`), generation 2 left a LAPIC timer armed *before* a live `set_dilation` running at the old rate. A guest `sleep 0.25` in flight across a 4 → 8 raise overran by up to 249 ms of guest time. Generation 3 re-arms in-flight timers after the ratio change, and the worst overrun across 20 raise/drop pairs is 36 ms. AMD hosts were not affected. If you installed the patch from 0.7.0, run `make dilation-install` again from a 0.8.0 tree.
+
+The same timer detail affects lockstep jumps on Intel. A jumped LAPIC one-shot on the preemption timer fires at the next pause rather than at its host deadline, so `auto_warp jump` compresses a crash-loop backoff somewhat less on those hosts: 163 s against a 200 s ceiling, versus about 132 s on AMD.
+
 ## What is and is not compressible
 
 - **Compressible:** guest-side waiting — timers, backoffs, probe periods, lease TTLs, reconcile intervals.

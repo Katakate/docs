@@ -14,6 +14,7 @@ Live copy-on-write fork requires parent and child memory to be mappings **in the
 | Guest → host | KVM hardware isolation — the same boundary Firecracker and Kata rely on |
 | Between unrelated trees on one host | Separate bridges (inter-tree forwarding dropped by the jail), separate guest memory files, per-tree cgroup |
 | Between sibling CoW forks of one tree | **Weaker** — parent and child share one daemon address space by design. A hypothetical daemon-level memory-safety bug could expose one fork's memory to code exploiting another |
+| Between trees that opted into `ksm` (0.8.0) | **Weaker still** — `ksmd` merges identical pages across every opted-in tree on the host, which is a cross-VM timing side channel. Off by default; k7d never starts `ksmd`. Use it on same-tenant hosts only |
 
 If your threat model is "mutually hostile customers on shared hardware", run those pods on [RuntimeClass `k7-fc`](#firecracker-profile-k7-fc) — the same daemon and shim, but each VM is a stock Firecracker process in its own jail — put tenants on separate k7d hosts, or use K7's [kata-firecracker-devmapper backend](/k7/concepts/backends). If it is "thousands of copies of my own environment, some of which an agent will break on purpose", this design buys you the fork — and the jailer below keeps a rogue guest from reaching anything but its own bridge.
 

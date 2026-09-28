@@ -75,7 +75,7 @@ Wait for the agents over vsock, then for `kubectl get nodes` to show 3 Ready (ku
 {"op": "tree_adopt_cluster", "vm_ids": ["vm-…", "vm-…", "vm-…"], "tree_id": "t1", "budget": {"…": "…"}}
 ```
 
-Adoption writes the root keyframe (a full memory dump, ~8 s for 3 × 2 GiB — the only full dump the tree ever needs; children take O(divergence) [reflink keyframes](/k7d/concepts/snapshot-tree#keyframes)). From here it is an ordinary cluster tree: `tree_fork_batch`, `tree_protect`, `tree_prune`, [time warp](/k7d/guides/time-warp). The forked child's root disk is a `FICLONE` reflink of the source's (~2500 shared extents), so the fork is CoW on both memory and disk.
+Adoption writes the root keyframe (a full memory copy, the only one the tree ever needs; children take O(divergence) [reflink keyframes](/k7d/concepts/snapshot-tree#keyframes)). On 0.7.0 that froze each member in turn, ~8 s for 3 × 2 GiB. In 0.8.0 it is a [coordinated, pre-copied cut](/k7d/concepts/snapshot-tree#how-a-cluster-keyframe-is-cut) and each member pauses for tens of milliseconds. After adoption, tear the cluster down with `tree_drop` / `tree_prune`, not `stop_vm` on the old ids, and delete your root-disk images yourself afterwards. From here it is an ordinary cluster tree: `tree_fork_batch`, `tree_protect`, `tree_prune`, [time warp](/k7d/guides/time-warp). The forked child's root disk is a `FICLONE` reflink of the source's (~2500 shared extents), so the fork is CoW on both memory and disk.
 
 `kernel` must be the Ubuntu `vmlinuz`; leave `initrd` out. The daemon never substitutes the busybox pair for a disk-booted guest.
 
@@ -94,6 +94,7 @@ All of these are proven by an integration test that brings the workload up on th
 | Kubeflow Trainer v2.2.1 (TrainJob) on mock GPUs | digest-pinned | under 1 s |
 | Kueue v0.19.2 on mock GPUs (quota admits one, holds the second) | digest-pinned | under 1 s |
 | KubeRay v1.7.0 (CPU head + GPU worker) | digest-pinned | 580 ms |
+| Per-pod fake DCGM (one `DCGM_FI_DEV_*` series per `fake-gpu-N`, labelled with the owning `pod` / `namespace` / `container`) (0.8.0) | fixture DaemonSet | scrape survives the fork |
 | Soft-RoCE (`rdma_rxe` on guest `eth0`, `rdma link` + `ibv_devinfo` on ≥2 nodes) | in-guest | 540 ms |
 | **Redis 7** (AOF on) with an `INCR` loop mid-write on another node | manifests | **575 ms** client / 568 ms daemon; the child continues from the in-flight write |
 | Held apiserver `watch` + ClusterIP TCP stream through the fork | in-guest | streams survive on source and child, then diverge |
@@ -101,6 +102,19 @@ All of these are proven by an integration test that brings the workload up on th
 <Warning>
 The ML rows are **mocks** — a fake device plugin and a fake metrics endpoint. They prove the operators and the schedulers fork; they are not CUDA, not NCCL, not GPUDirect, not a PyTorch runtime.
 </Warning>
+
+### Fake-GPU fixture knobs
+
+The fake device plugin now looks enough like a GPU node for scheduler and operator tests. All of it is still a mock with no `/dev/nvidia*`. Only the per-pod DCGM test also warm-forks the cluster; the others prove the feature on a live cluster without forking it:
+
+| Knob | What it does | Test |
+|---|---|---|
+| `FAKE_GPU_COUNT` (default 2) | GPUs advertised per node. At 8 per node, an 8-GPU pod fits and a second stays Pending once the leftover nodes are 1-GPU fragments | `test_ubuntu_ml_gpu_count_eight_fits_and_fragments` |
+| `Allocate` device IDs | Sets `NVIDIA_VISIBLE_DEVICES` to the kubelet-assigned `fake-gpu-N` IDs, matching the kubelet pod-resources API | `test_ubuntu_ml_gpu_allocate_two_ids_match_pod_resources` |
+| `FAKE_DCGM_GPU_UTIL` / `FAKE_DCGM_FB_USED` (defaults 42 / 1024), or pod annotations `k7d.katakate.org/fake-dcgm-gpu-util` / `fake-dcgm-fb-used` | Values of the per-pod `DCGM_FI_DEV_*` series. The labels drop when the pod is deleted | `test_ubuntu_ml_dcgm_per_pod` |
+| `FAKE_GPU_PRODUCT`, topology env, or a per-node `fake-gpu-identity` ConfigMap | Product and block/rack node labels. Kueue ResourceFlavors `fake-h100` / `fake-l40s` route Jobs to matching nodes, and a required-block Topology-Aware Scheduling Job lands in one fake block | `test_ubuntu_ml_gpu_flavors` |
+
+A **RayJob** on digest-pinned CPU `rayproject/ray:2.47.1-py311` (8 GiB / 4 vCPU nodes) with a worker requesting `nvidia.com/gpu: 1` reaches `SUCCEEDED` (`test_ubuntu_ml_rayjob_gpu_succeeded`). `ray status` shows `0.0/1.0 GPU` even without `rayStartParams.num-gpus`, because KubeRay injects `--num-gpus` from the `nvidia.com/gpu` request. Ray sees a count, not a device.
 
 Image pulls are the long pole, not the fork: Cilium to 3/3 Ready is ~190 s after Helm, Longhorn ~350 s. The fork of the finished cluster stays under the 1 s ceiling in every row. Full tables: [Benchmarks](/k7d/deep-dives/benchmarks).
 
@@ -110,7 +124,7 @@ The on-disk tree outlives the daemon that forked it. If `k7d` is killed with `SI
 
 ## Persistent data disks
 
-An Ubuntu node's root disk is ephemeral like any other VM disk — `stop_vm` deletes it. Storage nodes need a disk that outlives the VM, so `VmConfig.data_disks` attaches **named** ext4 images:
+An Ubuntu node's root disk is a throwaway per-VM clone. It is a caller-supplied `block_devices` image, so k7d never unlinks it, and the caller deletes it along with the VM or tree. Storage nodes need a disk the daemon keeps across VMs, so `VmConfig.data_disks` attaches **named** ext4 images:
 
 ```json
 "data_disks": [{"id": "longhorn-0", "size_bytes": 17179869184, "guest_mount": "/var/lib/longhorn"}]

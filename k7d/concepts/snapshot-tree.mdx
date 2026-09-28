@@ -19,7 +19,7 @@ A tree's payload is either a **single VM** or a **whole cluster** (N member VMs 
 |---|---|
 | `tree_create` / `tree_create_cluster` / `tree_adopt_cluster` | Root a tree at a freshly booted VM, a fresh N-VM cluster, or live VMs the daemon already owns. Writes the root's keyframe |
 | `tree_fork` / `tree_fork_batch` | Fork one or N branches from a live or suspended node. Batch forks share one dirty-bitmap capture. Optional `dilation` for the children's clock |
-| `tree_prepare_fork_source` | Write a node's keyframe now (idempotent) instead of on its first fork |
+| `tree_prepare_fork_source` | Write a node's keyframe now (idempotent) instead of on its first fork. `refresh: true` (0.8.0) re-keyframes a node that already owns one |
 | `tree_rollback` | Non-destructive: create a new branch from an earlier node's state |
 | `tree_suspend` | Write a node's delta to disk and free its RAM |
 | `tree_resume` | Bring a suspended node back live (members get fresh vsock CIDs, returned in the response) |
@@ -27,13 +27,22 @@ A tree's payload is either a **single VM** or a **whole cluster** (N member VMs 
 | `tree_prune` | Delete a node and its whole subtree, disk included |
 | `tree_auto_evict` | Run budget-driven LRU eviction now |
 | `tree_watch` | Stream every mutation (`fork`, `protect`, `suspend`, `resume`, `prune`, `evict`, `drop`) on one connection |
-| `tree_drop` | Forget a tree: live payloads torn down, on-disk state kept |
+| `tree_drop` | Forget a tree: live guests stopped, on-disk state kept |
 
 Full request/response shapes: [Daemon API](/k7d/api/protocol).
 
+### Who owns an adopted VM
+
+`tree_adopt_cluster` moves the member VMs out of the daemon's sandbox registry and into the tree. From then on the tree owns their teardown:
+
+- `stop_vm` on an adopted id errors with `was adopted into tree …; use tree_prune / tree_drop` and frees nothing (0.8.0). On 0.7.0 it returned `no such VM`, which a client could mistake for "already gone" and leak the guests.
+- `tree_drop`, or `tree_prune` of the root, stops the guests. In 0.8.0, with `K7D_PRIVSEP=on`, it also releases the node broker's pins on their disks. On 0.7.0 those pins stayed open until the broker process exited. A child prune leaves the pins alone, because the root still maps those disks.
+- Disk images you passed in `block_devices` are never unlinked by k7d. Delete them yourself after the tree is gone.
+- `list_vms` only lists the sandbox registry. Adopted members, `tree_create*` guests, and tree forks do not appear there, so do not `stop_vm` everything `list_vms` returns and assume the node is clean. Use `tree_list`, and `tree_nodes.live_guest_cids` to reach a member.
+
 ## Keyframes
 
-A node that is a fork source needs a **keyframe** — a `memory.bin` on disk that its children's `MAP_PRIVATE` mappings are views of ([CoW fork](/k7d/concepts/cow-fork)). Roots get theirs at create/adopt time, and that one is a full dump (~7.8 s for a 3 × 2 GiB Ubuntu cluster; there is no ancestor to clone).
+A node that is a fork source needs a **keyframe** — a `memory.bin` on disk that its children's `MAP_PRIVATE` mappings are views of ([CoW fork](/k7d/concepts/cow-fork)). Roots get theirs at create/adopt time, and that one is a full copy of guest RAM, since there is no ancestor to clone. On 0.7.0 the members were frozen for it one at a time (~7.8 s for a 3 × 2 GiB Ubuntu cluster). In 0.8.0 it is pre-copied while the cluster runs, and the pause is tens of milliseconds ([below](#how-a-cluster-keyframe-is-cut)).
 
 Children are cheaper. Forking *from* a child clones the nearest ancestor's `memory.bin` with a filesystem reflink (`FICLONE`, ~100 µs) and overwrites only the pages that node has dirtied since it was forked. The keyframe costs **O(divergence), not O(guest RAM)**:
 
@@ -46,6 +55,39 @@ Children are cheaper. Forking *from* a child clones the nearest ancestor's `memo
 Two things to know: the disk figure is the *workload's*, not the clone's — three k3s nodes dirty a fifth of guest RAM in 30 s of doing nothing, and nothing on this path can make a busy node's keyframe small. And a reflinked file lies to `du` and `stat` (both count shared extents as if the child owned them), so the daemon records the true physical cost at write time — `base_disk_bytes` on the `tree_prepared` reply and in `tree_nodes` — and the disk budget counts that. A child whose tree root is not on a reflink filesystem falls back to the full dump, loudly (`wrote_base_incremental: false`).
 
 A child does not need its own keyframe to *be forked from* later if an ancestor's suffices — `has_base_snapshot` in `tree_nodes` tells you which nodes own one.
+
+### How a cluster keyframe is cut
+
+A cluster's keyframes have to be one instant of the whole cluster. If they are not, a member can be restored to a point before packets that its peers have already acknowledged. In 0.8.0, `tree_create_cluster`, `tree_adopt_cluster`, and child keyframes of native clusters are written as one **coordinated cut**:
+
+1. **Pre-copy while the members run.** Each member's RAM is copied into its new `memory.bin`. A root copies its whole memory; a child reflinks its ancestor and copies only the pages it has dirtied. Dirty-log rounds then re-copy what changed, and every member runs one final catch-up round.
+2. **Pause everything, write the residual.** Every member is paused at once, the pages dirtied since the last round are written in parallel, and each member is restore-swapped onto its keyframe straight from the pause. No member resumes before its swap, since anything it did in between would be rewound after its peers had seen it.
+
+| Measurement (AMD host unless noted) | Result |
+|---|---|
+| 30 GiB member (22 GiB touched, writer running) + 512 MiB member | max pause **44 ms** (full paused dump of the same member: **48.9 s**); prepare wall time 57 s with the guest running |
+| Child keyframe of that cluster (256 MiB written in the child) | max pause **38 ms** |
+| Same test on an Intel host | root **27 ms** (vs 33.6 s full dump); child **22 ms** |
+| 3 × 1 GiB root | max pause 54 ms |
+| 3 × 2 GiB Ubuntu k3s, coordinated cut before pre-copy | root **2.13 s** (was 7.79 s member by member); children 0.50 s idle, 0.48 s k8s churn, 0.78 s Kafka |
+
+The pause is roughly the residual over page-cache write bandwidth, plus state capture and the swap. A guest that dirties memory faster than the host can write stops pre-copying after a fixed number of rounds, so its pause is about one round of its dirty rate. The wall time of the prepare is still O(guest RAM), but the guest keeps running during it. `tree_created.pause_ns` / `max_pause_ns` report what each member actually lost.
+
+Exceptions: members with virtiofs shares, and members whose virtio workers miss the 200 ms park, still take a full paused dump (with a loud warning). Firecracker roots still prepare member by member. Any guest keepalive shorter than the pause can still break. k3s' remotedialer tunnel times out after 60 s, and `kubectl exec` / `logs` to a frozen member return 502 until its agent reconnects.
+
+### Refreshing a keyframe
+
+A root keyframe ages. After hours of divergence, every fork copies the root's accumulated dirty set again. `tree_prepare_fork_source` with `refresh: true` (0.8.0) writes a new **generation** for a node that already owns a keyframe:
+
+```json
+{"op": "tree_prepare_fork_source", "tree_id": "t1", "node_id": "root", "refresh": true}
+```
+
+The new files go to `nodes/<id>/gen-<identity>/members/<i>/memory.bin`, written incrementally against the node's own previous keyframe through the same coordinated cut, and the members are swapped onto them. The old `memory.bin` stays where it is: live children keep mapping it, and a suspended child resumes against the generation it was packed against. The next fork copies only the pages dirtied after the refresh.
+
+### Suspend and resume of a checkpoint
+
+`tree_suspend` writes a node's post-keyframe dirty pages to `delta.pack` and leaves `memory.bin` at the keyframe. On 0.7.0, resuming a node that was its **own** nearest checkpoint (a root, typically) skipped that pack. The node came back with later CPU state on keyframe RAM, and guest writes made after the keyframe were lost. LRU eviction can suspend an unprotected root, so this was reachable without calling `tree_suspend` yourself. In 0.8.0 the pack is always applied. A root left `Suspended` by a daemon crash has no pack, so it resumes from its keyframe alone.
 
 ## Budgets
 
@@ -64,15 +106,21 @@ The budget also sizes the tree's [cgroup jail](/k7d/concepts/security#per-tree-c
 
 ## LRU eviction
 
-Under budget pressure, the daemon **suspends** the least-recently-active unprotected nodes: their delta goes to disk and their RAM is freed. Suspended nodes can be resumed later. Proactive suspension kicks in at 85% of the RAM budget — kept well below OOM territory and kernel reclaim stalls — and before a keyframe is written the daemon makes disk headroom the same way.
+Under budget pressure, the daemon **suspends** the least-recently-active unprotected nodes, the root included: their delta goes to disk and their RAM is freed. Suspended nodes can be resumed later. Proactive suspension kicks in at 85% of the RAM budget — kept well below OOM territory and kernel reclaim stalls — and before a keyframe is written the daemon makes disk headroom the same way.
 
 `tree_protect` pins a node (a winner you cannot afford to lose) so budget pressure can't touch it. Eviction never deletes state — only `tree_prune` does.
+
+## Sharing identical pages (KSM)
+
+Sibling forks of one cluster start from the same keyframe, and many of their pages stay identical. In 0.8.0, `ksm: true` on `tree_create_cluster` / `tree_adopt_cluster` lets the kernel's `ksmd` merge those pages. The process that owns the guest mappings (the VM broker under privilege separation) calls `madvise(MADV_MERGEABLE)` on each member's `MAP_PRIVATE` RAM after the guest is running, so the fork pause does not grow. Forks inherit the flag.
+
+k7d does not start `ksmd`. An operator has to (`echo 1 > /sys/kernel/mm/ksm/run`), and `k7d doctor` prints its state on an advisory line. `tree_nodes.live_ksm` reports each live member's merged pages. This is off by default and only for **same-tenant hosts**: KSM merges across every tree on the machine that opted in, and that is a timing side channel between VMs. See [Security model](/k7d/concepts/security).
 
 The budget/eviction bookkeeping is one of the two formally verified pieces of k7d: the model is translated to Lean via Aeneas and its invariants are machine-checked. See [Formal verification](/k7d/deep-dives/formal-verification).
 
 ## Node metadata
 
-`tree_nodes` returns every node's metadata (`NodeInfo`): id, parent, children, state, label, `dirty_page_count` (pages this node's delta captures; Σ over members for a cluster), `has_base_snapshot` (the node owns a keyframe), `base_disk_bytes`, `created_at_unix`, `last_active_at_unix` (what LRU ranks on), `protected`, payload `kind` (`Vm` or `Cluster`), and `vm_count` — plus, alongside the list, the tree's live `usage` against its `budget`, `live_guest_cids` per live node, and `live_dilation` per live node. `tree_list` carries `usage` and `budget` per tree. `tree_watch` delivers the same snapshot once, then one event per mutation with the daemon's `latency_ns` for forks.
+`tree_nodes` returns every node's metadata (`NodeInfo`): id, parent, children, state, label, `dirty_page_count` (pages this node's delta captures; Σ over members for a cluster), `has_base_snapshot` (the node owns a keyframe), `base_disk_bytes`, `created_at_unix`, `last_active_at_unix` (what LRU ranks on), `protected`, payload `kind` (`Vm` or `Cluster`), and `vm_count` — plus, alongside the list, the tree's live `usage` against its `budget`, `live_guest_cids` per live node, and `live_dilation` per live node. In 0.8.0 it also carries `dilation_policy` and `dilation_trajectory` per node (see [adaptive dilation](/k7d/guides/time-warp#adaptive-dilation-per-tree-policy-loop)) and `live_ksm` per live node. `tree_list` carries `usage` and `budget` per tree. `tree_watch` delivers the same snapshot once, then one event per mutation with the daemon's `latency_ns` for forks.
 
 ## Related pages
 

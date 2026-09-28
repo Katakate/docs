@@ -29,7 +29,9 @@ Disk state is copied with **filesystem reflinks** (`FICLONE` on the daemon's XFS
 
 ### Forking from a fork: reflink keyframes
 
-The base image a child's `MAP_PRIVATE` mapping points at is its source's **keyframe**. A root's keyframe is a full dump. A child's is a reflink clone of the nearest ancestor's keyframe with only that child's dirty pages written over it — O(divergence) rather than O(guest RAM), ~0.8 s instead of ~7.8 s for an idle 3 × 2 GiB cluster. That is what makes deep trees affordable: every fork point below the root costs what the node changed, not what the guest is. Details and the measured divergence levels: [Snapshot tree — keyframes](/k7d/concepts/snapshot-tree#keyframes).
+The base image a child's `MAP_PRIVATE` mapping points at is its source's **keyframe**. A root's keyframe is a full dump. A child's is a reflink clone of the nearest ancestor's keyframe with only that child's dirty pages written over it: O(divergence) rather than O(guest RAM), ~0.8 s instead of ~7.8 s for an idle 3 × 2 GiB cluster on 0.7.0. That is what makes deep trees affordable: every fork point below the root costs what the node changed, not what the guest is. Details and the measured divergence levels: [Snapshot tree — keyframes](/k7d/concepts/snapshot-tree#keyframes).
+
+In 0.8.0, a native cluster's keyframes are also **pre-copied** while the members keep running. Dirty-log rounds copy what changed, and the members are then paused together for a short cut that writes only the residual. The guest's pause no longer grows with its RAM: 44 ms for a 30 GiB member, against 48.9 s for a paused full dump. This uses the same dirty tracking as the warm fork, applied to a guest that is still running. See [Snapshot tree — how a cluster keyframe is cut](/k7d/concepts/snapshot-tree#how-a-cluster-keyframe-is-cut).
 
 ## What had to be right
 
@@ -43,6 +45,8 @@ These are the kinds of bugs that silently break "byte-identical". The project's 
 ## After the fork: reconnecting to the guest
 
 The fork inherits the source's vsock device state, including any open agent connection — but the fork gets a fresh vsock CID. k7d injects a virtio-vsock `TRANSPORT_RESET` event into the *fork's* device state only: the guest sees its connection drop, the in-guest agent reconnects on the new CID, and the host can talk to the fresh fork. The source keeps its CID across the prepare that made it fork-ready, so `kubectl exec` against a source pod keeps working.
+
+Connections opened to the source *before* that prepare do not error. They go silent, because a native vsock read does not treat the swapped backend's EOF as fatal. A client holding one has to bound its reads and redial the same CID. The shim does this itself in 0.8.0: its log bridge caps each read at 1 s and closes the container's stdio FIFOs when it is torn down. Without that, a fork source pod could take the full 30 s agent deadline to delete.
 
 Guest clocks are re-based so time does not jump backwards — and because k7d owns the guest clock end to end, the same pause can also move it *forward* on purpose. That is [Time warp](/k7d/guides/time-warp).
 

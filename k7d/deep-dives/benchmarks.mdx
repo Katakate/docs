@@ -116,6 +116,22 @@ A fork point below the root clones the nearest ancestor's `memory.bin` with `FIC
 
 Test: `test_keyframe_cost_ubuntu_divergence_levels`. The bytes are the daemon's `base_disk_bytes`; `du` and `stat` cannot measure a reflinked file. Neither the keyframe nor the full dump it replaces is fsynced — syncing a patched reflinked file costs 2–5 s per member because every written page breaks a shared extent.
 
+The table above is 0.7.0, where members were keyframed one after another. In 0.8.0, root and child keyframes are one coordinated cut with parallel member writes. The same test on the same AMD node (2026-09-27): root **2.13 s**, children idle **0.50 s**, k8s **0.48 s**, Kafka **0.78 s** (49.8%).
+
+### Keyframe pause
+
+In 0.8.0, members are also pre-copied while running, so what the guest loses is a short residual cut, not the dump. `tree_created.pause_ns` reports the per-member figure. These are measurements, not budgets:
+
+| Measurement | Result | Test |
+|---|---|---|
+| 30 GiB member (22 GiB touched, guest writer running) + 512 MiB member, AMD | max pause **44 ms**; paused write 16 ms / 10 MiB; 22 GiB copied live; dirty-log arm stop 0.244 s; prepare wall time 57 s | `test_cluster_tree_root_keyframe_precopy_large` |
+| Same member, full paused `snapshot` | **48.9 s** | same |
+| Child keyframe of that cluster (256 MiB written in the child) | max pause **38 ms**; 298 MiB disk; wall 0.23 s | same |
+| Same test on Intel | root **27 ms** vs **33.6 s** full dump; child **22 ms** | same |
+| 3 × 1 GiB, AMD | max pause 54 ms (1.19 s as a paused parallel dump) | `test_cluster_tree_root_keyframe_is_one_cut` |
+
+Turning on dirty logging for a member that does not have it yet is one short separate stop before the cut (the "arm stop"), because it write-protects the memory slots.
+
 ## Time warp
 
 An 8.7-minute guest-time episode on a fresh 3-node Ubuntu k3s cluster, three runs per arm (`make warp-bench`, a Criterion bench kept out of `make check` for its runtime):
@@ -126,6 +142,8 @@ An 8.7-minute guest-time episode on a fresh 3-node Ubuntu k3s cluster, three run
 | `auto_warp` `jump` | **286 s (1.83×)** | zero delta: same probe failures, restarts, leases, splats |
 | Continuous dilation ×8 (KVM patch) | **79 s (8.00×)** | bounded: `fsync` 2.3 → 14 ms guest-visible, pod RTT 0.69 → 0.92 ms, churn 86 → 37 rounds |
 | Both | 76 s (8.11×) | do not stack |
+
+The `down` and `track` policies that the adaptive loop in 0.8.0 runs, against two fixed factors, over one scripted 240 s guest-time episode: fixed ×8 **32.0 s (8.00×)**, fixed ×4 **60.9 s (4.00×)**, `down` **128.4 s (1.91×)**, `track` **73.9 s (3.37×)**, with zero hard failures in every arm. A live factor change takes 140 µs on one VM and 450 µs on 3 nodes.
 
 The dilation N sweep (compression exactly N through 16; extra probe failures 0 / 0 / 0 / 3 / 19 / 32 for N ∈ {1, 2, 4, 8, 12, 16}) and the fork-of-a-dilated-VM tests need the carried KVM patch loaded (`make dilation-install`; [`utils/kvm-dilation/`](https://github.com/katakate/k7d/tree/main/utils/kvm-dilation)) and are kept out of `make check`. See [Time warp](/k7d/guides/time-warp).
 
