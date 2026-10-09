@@ -8,11 +8,11 @@
     "dark": "#ef672b"
   },
   "appearance": {
-    "default": "dark",
-    "background": {
-      "color": {
-        "dark": "#000000"
-      }
+    "default": "dark"
+  },
+  "background": {
+    "color": {
+      "dark": "#000000"
     }
   },
   "favicon": "/k7d/favicon.png",
