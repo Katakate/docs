@@ -1,6 +1,6 @@
 # Katakate documentation
 
-Mintlify site for **Katakate** org projects: **K7** docs live under [`k7/`](./k7/), **K7d** under [`k7d/`](./k7d/). Configuration is at the repo root: [`docs.json`](./docs.json).
+Mintlify site for **Katakate** org projects: **K7** docs live under [`k7/`](./k7/), **K7d** under [`k7d/`](./k7d/). Configuration is at the repo root: `docs.json`.
 
 ## Local preview
 
